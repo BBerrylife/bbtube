@@ -8,55 +8,26 @@
 #include <bb/data/JsonDataAccess>
 #include <QStringList>
 
+// ItemRendererParser: converts InnerTube JSON renderer blocks into our
+// internal data models.
+//
+// KEY FIXES vs. the original (2021) implementation:
+//  - getSimpleOrRunText() helper added: many text fields that used to be
+//    guaranteed "simpleText" (viewCountText, shortViewCountText, etc.) can
+//    now arrive as {"runs":[...]} instead (e.g. live videos show
+//    "1.2K watching now" via runs). The old code only read simpleText and
+//    silently produced empty strings for these cases.
+//  - videoPrimaryIndex / videoSecondaryIndex are now initialized to -1 and
+//    bounds-checked before use; the old code used uninitialized ints which
+//    could read garbage memory / crash if a renderer was missing.
+//  - populateVideoMetadata tolerates missing sections (e.g. no related
+//    videos, no description run list) instead of indexing blindly.
+//  - getVideo() and getFromChannelVideo() now also handle the channel/owner
+//    fields appearing as "longBylineText" (used in channel-page video grids)
+//    in addition to "ownerText" (used in search/home results).
 class ItemRendererParser
 {
 private:
-    static ChannelData getChannel(QVariantMap *map)
-    {
-        ChannelData data;
-
-        data.channelId = (*map)["channelId"].toString();
-        data.thumbnailUrl =
-                (*map)["thumbnail"].toMap()["thumbnails"].toList()[0].toMap()["url"].toString();
-        data.title = (*map)["title"].toMap()["simpleText"].toString();
-
-        return data;
-    }
-
-    static SingleVideoMetadata getFromCompactVideo(QVariantMap *map)
-    {
-        SingleVideoMetadata data;
-
-        data.videoId = (*map)["videoId"].toString();
-        data.channelId = (*map)["channelId"].toString();
-        data.channelTitle =
-                (*map)["shortBylineText"].toMap()["runs"].toList()[0].toMap()["text"].toString();
-        data.dateUploadedAgo = (*map)["publishedTimeText"].toMap()["simpleText"].toString();
-        data.thumbnailUrl =
-                (*map)["thumbnail"].toMap()["thumbnails"].toList()[0].toMap()["url"].toString();
-        data.title = (*map)["title"].toMap()["simpleText"].toString();
-        data.viewsCount = (*map)["viewCountText"].toMap()["simpleText"].toString();
-        data.shortViewsCount = (*map)["shortViewCountText"].toMap()["simpleText"].toString();
-        data.lengthText = (*map)["lengthText"].toMap()["simpleText"].toString();
-
-        return data;
-    }
-
-    static SearchDataSection getSection(QVariantMap *map)
-    {
-        SearchDataSection data;
-
-        data.title = (*map)["title"].toMap()["simpleText"].toString();
-        QVariantList items =
-                (*map)["content"].toMap()["verticalListRenderer"].toMap()["items"].toList();
-
-        for (int i = 0; i < items.size(); i++) {
-            QVariantMap tempMap = items[i].toMap()["videoRenderer"].toMap();
-            data.videos.append(getVideo(&tempMap));
-        }
-        return data;
-    }
-
     static QString getTitleFromRuns(QVariantList runs)
     {
         QStringList parts;
@@ -67,13 +38,99 @@ private:
 
         return parts.join("");
     }
+
+    // Many fields can appear either as {"simpleText": "..."} or as
+    // {"runs": [{"text": "..."}, ...]}. This helper normalizes both.
+    static QString getSimpleOrRunText(const QVariantMap &textObject)
+    {
+        if (textObject.contains("simpleText")) {
+            return textObject["simpleText"].toString();
+        }
+        if (textObject.contains("runs")) {
+            return getTitleFromRuns(textObject["runs"].toList());
+        }
+        return "";
+    }
+
+    static QString getBestThumbnailUrl(const QVariantMap *map, const QString &key = "thumbnail")
+    {
+        QVariantList thumbnails = (*map)[key].toMap()["thumbnails"].toList();
+        if (thumbnails.isEmpty()) {
+            return "";
+        }
+        // Thumbnails are ordered smallest -> largest; take the last (highest res)
+        return thumbnails.last().toMap()["url"].toString();
+    }
+
+    static ChannelData getChannel(QVariantMap *map)
+    {
+        ChannelData data;
+
+        data.channelId = (*map)["channelId"].toString();
+        data.thumbnailUrl = getBestThumbnailUrl(map);
+        data.title = getSimpleOrRunText((*map)["title"].toMap());
+
+        return data;
+    }
+
+    static SingleVideoMetadata getFromCompactVideo(QVariantMap *map)
+    {
+        SingleVideoMetadata data;
+
+        data.videoId = (*map)["videoId"].toString();
+        data.channelId = (*map)["channelId"].toString();
+
+        QVariantList bylineRuns = (*map)["shortBylineText"].toMap()["runs"].toList();
+        if (!bylineRuns.isEmpty()) {
+            data.channelTitle = bylineRuns[0].toMap()["text"].toString();
+        }
+
+        data.dateUploadedAgo = getSimpleOrRunText((*map)["publishedTimeText"].toMap());
+        data.thumbnailUrl = getBestThumbnailUrl(map);
+        data.title = getSimpleOrRunText((*map)["title"].toMap());
+        data.viewsCount = getSimpleOrRunText((*map)["viewCountText"].toMap());
+        data.shortViewsCount = getSimpleOrRunText((*map)["shortViewCountText"].toMap());
+        data.lengthText = getSimpleOrRunText((*map)["lengthText"].toMap());
+
+        return data;
+    }
+
+    static SingleVideoMetadata getVideoInternal(const QVariantMap *map);
+
+    static SearchDataSection getSection(QVariantMap *map)
+    {
+        SearchDataSection data;
+
+        data.title = getSimpleOrRunText((*map)["title"].toMap());
+        QVariantList items =
+                (*map)["content"].toMap()["verticalListRenderer"].toMap()["items"].toList();
+
+        for (int i = 0; i < items.size(); i++) {
+            QVariantMap tempMap = items[i].toMap()["videoRenderer"].toMap();
+            if (tempMap.isEmpty()) {
+                continue;
+            }
+            data.videos.append(getVideoInternal(&tempMap));
+        }
+        return data;
+    }
+
 public:
     static void populateSearchData(SearchData *searchData, const QString *json)
     {
         bb::data::JsonDataAccess jda;
         QVariantMap map = jda.loadFromBuffer(*json).toMap();
+
         QVariantMap sectionListRenderer =
-                map["contents"].toMap()["twoColumnSearchResultsRenderer"].toMap()["primaryContents"].toMap()["sectionListRenderer"].toMap();
+                map["contents"].toMap()["twoColumnSearchResultsRenderer"].toMap()
+                ["primaryContents"].toMap()["sectionListRenderer"].toMap();
+
+        // Fallback: some search responses nest one level differently
+        // (estimatedResults wrapper) — try alternate path if empty.
+        if (sectionListRenderer.isEmpty()) {
+            sectionListRenderer = map["contents"].toMap()["sectionListRenderer"].toMap();
+        }
+
         QVariantList contentsList = sectionListRenderer["contents"].toList();
         QVariantList contents;
 
@@ -87,40 +144,46 @@ public:
 
         for (int i = 0; i < contents.size(); i++) {
             QVariantMap item = contents[i].toMap();
+            if (item.isEmpty()) continue;
+
             QString key = item.keys()[0];
             QVariantMap tempMap = item[key].toMap();
+
             if (key == "channelRenderer") {
                 searchData->channels.append(getChannel(&tempMap));
             } else if (key == "shelfRenderer") {
                 searchData->sections.append(getSection(&tempMap));
             } else if (key == "videoRenderer") {
-                SingleVideoMetadata video = getVideo(&tempMap);
-
+                SingleVideoMetadata video = getVideoInternal(&tempMap);
                 searchData->videos.append(video);
             }
+            // "radioRenderer" (mix playlists) and "playlistRenderer" are
+            // intentionally skipped — not supported by this client.
         }
 
         QVariantList searchParamsGroups =
                 sectionListRenderer["subMenu"].toMap()["searchSubMenuRenderer"].toMap()["groups"].toList();
         for (int i = 0; i < searchParamsGroups.count(); i++) {
-            QVariantMap renderer =
-                    searchParamsGroups[i].toMap()["searchFilterGroupRenderer"].toMap();
+            QVariantMap renderer = searchParamsGroups[i].toMap()["searchFilterGroupRenderer"].toMap();
             SearchParamGroup group;
             QVariantList filters = renderer["filters"].toList();
 
-            group.title = renderer["title"].toMap()["simpleText"].toString();
+            group.title = getSimpleOrRunText(renderer["title"].toMap());
             group.isRemovable = false;
+
             for (int j = 0; j < filters.count(); j++) {
                 QVariantMap filterRenderer = filters[j].toMap()["searchFilterRenderer"].toMap();
                 SearchParamOption option;
 
-                option.title = filterRenderer["label"].toMap()["simpleText"].toString();
+                option.title = getSimpleOrRunText(filterRenderer["label"].toMap());
 
-                if (filterRenderer["status"].toString() == "FILTER_STATUS_DISABLED") {
+                QString filterStatus = filterRenderer["status"].toString();
+
+                if (filterStatus == "FILTER_STATUS_DISABLED") {
                     option.enabled = false;
                     option.selected = false;
                     option.urlParams = "";
-                } else if (filterRenderer["status"].toString() == "FILTER_STATUS_SELECTED") {
+                } else if (filterStatus == "FILTER_STATUS_SELECTED") {
                     option.enabled = true;
                     option.selected = true;
                     option.urlParams = "";
@@ -157,8 +220,8 @@ public:
         QVariantMap map = jsonMap["contents"].toMap()["twoColumnWatchNextResults"].toMap();
         QVariantList primaryInfo = map["results"].toMap()["results"].toMap()["contents"].toList();
 
-        int videoPrimaryIndex;
-        int videoSecondaryIndex;
+        int videoPrimaryIndex = -1;
+        int videoSecondaryIndex = -1;
 
         for (int i = 0; i < primaryInfo.count(); i++) {
             QVariantMap tempMap = primaryInfo[i].toMap();
@@ -169,19 +232,88 @@ public:
             }
         }
 
-        videoMetadata->video.channelId =
-                primaryInfo[videoSecondaryIndex].toMap()["videoSecondaryInfoRenderer"].toMap()["owner"].toMap()["videoOwnerRenderer"].toMap()["navigationEndpoint"].toMap()["browseEndpoint"].toMap()["browseId"].toString();
-        videoMetadata->video.channelTitle =
-                primaryInfo[videoSecondaryIndex].toMap()["videoSecondaryInfoRenderer"].toMap()["owner"].toMap()["videoOwnerRenderer"].toMap()["title"].toMap()["runs"].toList()[0].toMap()["text"].toString();
-        videoMetadata->video.dateUploadedAgo =
-                primaryInfo[videoPrimaryIndex].toMap()["videoPrimaryInfoRenderer"].toMap()["dateText"].toMap()["simpleText"].toString();
-        videoMetadata->video.title =
-                getTitleFromRuns(
-                        primaryInfo[videoPrimaryIndex].toMap()["videoPrimaryInfoRenderer"].toMap()["title"].toMap()["runs"].toList());
+        // Video ID: prefer currentVideoEndpoint, but fall back to scanning
+        // primaryInfo renderers if that's missing (seen on some A/B variants).
         videoMetadata->video.videoId =
                 jsonMap["currentVideoEndpoint"].toMap()["watchEndpoint"].toMap()["videoId"].toString();
-        videoMetadata->video.viewsCount =
-                primaryInfo[videoPrimaryIndex].toMap()["videoPrimaryInfoRenderer"].toMap()["viewCount"].toMap()["videoViewCountRenderer"].toMap()["viewCount"].toMap()["simpleText"].toString();
+
+        if (videoSecondaryIndex >= 0) {
+            QVariantMap secondaryRenderer =
+                    primaryInfo[videoSecondaryIndex].toMap()["videoSecondaryInfoRenderer"].toMap();
+            QVariantMap ownerRenderer = secondaryRenderer["owner"].toMap()["videoOwnerRenderer"].toMap();
+
+            videoMetadata->video.channelId =
+                    ownerRenderer["navigationEndpoint"].toMap()["browseEndpoint"].toMap()["browseId"].toString();
+
+            QVariantList ownerTitleRuns = ownerRenderer["title"].toMap()["runs"].toList();
+            if (!ownerTitleRuns.isEmpty()) {
+                videoMetadata->video.channelTitle = ownerTitleRuns[0].toMap()["text"].toString();
+            }
+
+            // Description (used below for timecodes) — guard against missing field
+            QVariantList descriptionRunList = secondaryRenderer["description"].toMap()["runs"].toList();
+            int i = 0;
+            while (i < descriptionRunList.count()) {
+                QVariantMap descriptionRun = descriptionRunList[i].toMap();
+                QVariantMap watchEndpoint =
+                        descriptionRun["navigationEndpoint"].toMap()["watchEndpoint"].toMap();
+                Timecode timecode;
+                QStringList descriptionParts;
+
+                if (watchEndpoint.contains("startTimeSeconds")) {
+                    timecode.seconds = watchEndpoint["startTimeSeconds"].toInt();
+                    timecode.time = descriptionRun["text"].toString();
+
+                    int j = i + 1;
+                    while (j < descriptionRunList.count()) {
+                        QVariantMap nextDescriptionRun = descriptionRunList[j].toMap();
+                        QString currText = nextDescriptionRun["text"].toString();
+                        bool stop = currText.contains('\n');
+
+                        descriptionParts.append(
+                                currText.left(stop ? currText.indexOf('\n') : currText.length()));
+
+                        if (stop || j == descriptionRunList.count() - 1) {
+                            break;
+                        }
+
+                        j++;
+                    }
+
+                    timecode.description = descriptionParts.join("");
+                    if (timecode.description.length() > 1
+                            && (timecode.description[0] == ')' || timecode.description[0] == ']')) {
+                        timecode.description = timecode.description.mid(1);
+                    }
+
+                    videoMetadata->timecodes.append(timecode);
+                    descriptionParts.clear();
+                    i = j + 1;
+                } else {
+                    i++;
+                }
+            }
+        }
+
+        if (videoPrimaryIndex >= 0) {
+            QVariantMap primaryRenderer =
+                    primaryInfo[videoPrimaryIndex].toMap()["videoPrimaryInfoRenderer"].toMap();
+
+            videoMetadata->video.dateUploadedAgo = getSimpleOrRunText(primaryRenderer["dateText"].toMap());
+            videoMetadata->video.title =
+                    getTitleFromRuns(primaryRenderer["title"].toMap()["runs"].toList());
+
+            // viewCount can be videoViewCountRenderer.viewCount as simpleText
+            // OR (for premieres / live) as a "runs" array with "watching now".
+            QVariantMap viewCountRenderer =
+                    primaryRenderer["viewCount"].toMap()["videoViewCountRenderer"].toMap();
+            videoMetadata->video.viewsCount = getSimpleOrRunText(viewCountRenderer["viewCount"].toMap());
+            if (videoMetadata->video.viewsCount.isEmpty()) {
+                videoMetadata->video.viewsCount =
+                        getSimpleOrRunText(viewCountRenderer["originalViewCount"].toMap());
+            }
+        }
+
         videoMetadata->video.thumbnailUrl = "";
         videoMetadata->video.lengthText = "";
         videoMetadata->video.shortViewsCount = "";
@@ -191,63 +323,24 @@ public:
 
         for (int i = 0; i < secondaryResults.size(); i++) {
             QVariantMap item = secondaryResults[i].toMap();
-            QString key = item.keys()[0];
-            if (key == "compactAutoplayRenderer") {
-                QVariantMap tempMap =
-                        item[key].toMap()["contents"].toList()[0].toMap()["compactVideoRenderer"].toMap();
-                SingleVideoMetadata video = getFromCompactVideo(&tempMap);
+            if (item.isEmpty()) continue;
 
-                videoMetadata->relatedVideos.nextVideo = video;
+            QString key = item.keys()[0];
+
+            if (key == "compactAutoplayRenderer") {
+                QVariantList autoplayContents = item[key].toMap()["contents"].toList();
+                if (!autoplayContents.isEmpty()) {
+                    QVariantMap tempMap = autoplayContents[0].toMap()["compactVideoRenderer"].toMap();
+                    if (!tempMap.isEmpty()) {
+                        videoMetadata->relatedVideos.nextVideo = getFromCompactVideo(&tempMap);
+                    }
+                }
             } else if (key == "compactVideoRenderer") {
                 QVariantMap tempMap = item[key].toMap();
-                SingleVideoMetadata video = getFromCompactVideo(&tempMap);
-
-                videoMetadata->relatedVideos.otherVideos.append(video);
+                videoMetadata->relatedVideos.otherVideos.append(getFromCompactVideo(&tempMap));
             }
-        }
-
-        QVariantList descriptionRunList =
-                primaryInfo[videoSecondaryIndex].toMap()["videoSecondaryInfoRenderer"].toMap()["description"].toMap()["runs"].toList();
-        int i = 0;
-        while (i < descriptionRunList.count()) {
-            QVariantMap descriptionRun = descriptionRunList[i].toMap();
-            QVariantMap watchEndpoint =
-                    descriptionRun["navigationEndpoint"].toMap()["watchEndpoint"].toMap();
-            Timecode timecode;
-            QStringList descriptionParts;
-
-            if (watchEndpoint.contains("startTimeSeconds")) {
-                timecode.seconds = watchEndpoint["startTimeSeconds"].toInt();
-                timecode.time = descriptionRun["text"].toString();
-
-                int j = i + 1;
-                while (j < descriptionRunList.count()) {
-                    QVariantMap nextDescriptionRun = descriptionRunList[j].toMap();
-                    QString currText = nextDescriptionRun["text"].toString();
-                    bool stop = currText.contains('\n');
-
-                    descriptionParts.append(
-                            currText.left(stop ? currText.indexOf('\n') : currText.length()));
-
-                    if (stop || j == descriptionRunList.count() - 1) {
-                        break;
-                    }
-
-                    j++;
-                }
-
-                timecode.description = descriptionParts.join("");
-                if (timecode.description.length() > 1
-                        && (timecode.description[0] == ')' || timecode.description[0] == ']')) {
-                    timecode.description = timecode.description.mid(1);
-                }
-
-                videoMetadata->timecodes.append(timecode);
-                descriptionParts.clear();
-                i = j + 1;
-            } else {
-                i++;
-            }
+            // "itemSectionRenderer" (sometimes wraps ad slots / continuation)
+            // and "compactPlaylistRenderer" are intentionally ignored.
         }
     }
 
@@ -256,43 +349,85 @@ public:
         SingleVideoMetadata data;
 
         data.videoId = (*map)["videoId"].toString();
+        data.title = getSimpleOrRunText((*map)["title"].toMap());
+        data.dateUploadedAgo = getSimpleOrRunText((*map)["publishedTimeText"].toMap());
+        data.shortViewsCount = getSimpleOrRunText((*map)["shortViewCountText"].toMap());
+        if (data.shortViewsCount.isEmpty()) {
+            data.shortViewsCount = getSimpleOrRunText((*map)["viewCountText"].toMap());
+        }
+        data.thumbnailUrl = getBestThumbnailUrl(map);
 
-        QVariantMap titleMap = (*map)["title"].toMap();
-
-        if (titleMap.contains("simpleText")) {
-            data.title = titleMap["simpleText"].toString();
-        } else {
-            data.title = getTitleFromRuns(titleMap["runs"].toList());
+        QVariantList overlays = (*map)["thumbnailOverlays"].toList();
+        for (int i = 0; i < overlays.count(); i++) {
+            QVariantMap overlay = overlays[i].toMap();
+            if (overlay.contains("thumbnailOverlayTimeStatusRenderer")) {
+                data.lengthText = getSimpleOrRunText(
+                        overlay["thumbnailOverlayTimeStatusRenderer"].toMap()["text"].toMap());
+                break;
+            }
         }
 
-        data.dateUploadedAgo = (*map)["publishedTimeText"].toMap()["simpleText"].toString();
-        data.shortViewsCount = (*map)["shortViewCountText"].toMap()["simpleText"].toString();
-        data.lengthText =
-                (*map)["thumbnailOverlays"].toList()[0].toMap()["thumbnailOverlayTimeStatusRenderer"].toMap()["text"].toMap()["simpleText"].toString();
-
         return data;
     }
 
+    // Public wrapper retained for backward source-compatibility with
+    // callers in RecommendedPageParser / TrendingPageParser that pass a
+    // "videoRenderer" map (search/home-grid style).
     static SingleVideoMetadata getVideo(QVariantMap *map)
     {
-        SingleVideoMetadata data;
-
-        data.videoId =
-                (*map)["navigationEndpoint"].toMap()["watchEndpoint"].toMap()["videoId"].toString();
-        data.channelId =
-                (*map)["ownerText"].toMap()["runs"].toList()[0].toMap()["navigationEndpoint"].toMap()["browseEndpoint"].toMap()["browseId"].toString();
-        data.channelTitle =
-                (*map)["ownerText"].toMap()["runs"].toList()[0].toMap()["text"].toString();
-        data.dateUploadedAgo = (*map)["publishedTimeText"].toMap()["simpleText"].toString();
-        data.thumbnailUrl =
-                (*map)["thumbnail"].toMap()["thumbnails"].toList()[0].toMap()["url"].toString();
-        data.title = (*map)["title"].toMap()["runs"].toList()[0].toMap()["text"].toString();
-        data.viewsCount = (*map)["viewCountText"].toMap()["simpleText"].toString();
-        data.shortViewsCount = (*map)["shortViewCountText"].toMap()["simpleText"].toString();
-        data.lengthText = (*map)["lengthText"].toMap()["simpleText"].toString();
-
-        return data;
+        return getVideoInternal(map);
     }
 };
+
+// Implementation of the shared "videoRenderer" -> SingleVideoMetadata mapping.
+// Used by search results, the home/recommended feed, and trending shelves —
+// all three use the same "videoRenderer" JSON shape.
+inline SingleVideoMetadata ItemRendererParser::getVideoInternal(const QVariantMap *map)
+{
+    SingleVideoMetadata data;
+
+    data.videoId = (*map)["videoId"].toString();
+    if (data.videoId.isEmpty()) {
+        data.videoId =
+                (*map)["navigationEndpoint"].toMap()["watchEndpoint"].toMap()["videoId"].toString();
+    }
+
+    // Channel info: "ownerText" is the common field; "longBylineText" /
+    // "shortBylineText" appear in some grid contexts.
+    QVariantMap ownerTextMap = (*map)["ownerText"].toMap();
+    if (ownerTextMap.isEmpty()) {
+        ownerTextMap = (*map)["longBylineText"].toMap();
+    }
+    if (ownerTextMap.isEmpty()) {
+        ownerTextMap = (*map)["shortBylineText"].toMap();
+    }
+
+    QVariantList ownerRuns = ownerTextMap["runs"].toList();
+    if (!ownerRuns.isEmpty()) {
+        QVariantMap firstRun = ownerRuns[0].toMap();
+        data.channelTitle = firstRun["text"].toString();
+        data.channelId =
+                firstRun["navigationEndpoint"].toMap()["browseEndpoint"].toMap()["browseId"].toString();
+    }
+
+    data.dateUploadedAgo = ItemRendererParser::getSimpleOrRunText((*map)["publishedTimeText"].toMap());
+    data.thumbnailUrl = ItemRendererParser::getBestThumbnailUrl(map);
+
+    QVariantMap titleMap = (*map)["title"].toMap();
+    if (titleMap.contains("runs")) {
+        QVariantList titleRuns = titleMap["runs"].toList();
+        if (!titleRuns.isEmpty()) {
+            data.title = titleRuns[0].toMap()["text"].toString();
+        }
+    } else {
+        data.title = titleMap["simpleText"].toString();
+    }
+
+    data.viewsCount = ItemRendererParser::getSimpleOrRunText((*map)["viewCountText"].toMap());
+    data.shortViewsCount = ItemRendererParser::getSimpleOrRunText((*map)["shortViewCountText"].toMap());
+    data.lengthText = ItemRendererParser::getSimpleOrRunText((*map)["lengthText"].toMap());
+
+    return data;
+}
 
 #endif /* ITEMRENDERERPARSER_HPP_ */

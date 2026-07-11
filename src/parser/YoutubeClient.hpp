@@ -11,6 +11,7 @@
 #include <QtNetwork/QNetworkRequest>
 #include <QtNetwork/QNetworkReply>
 #include <QStringList>
+#include <QMap>
 
 class YoutubeClient: public QObject
 {
@@ -41,6 +42,7 @@ signals:
     void trendingDataReceived(TrendingData trendingData);
     void recommendedNextBatchReceived(RecommendedData recommendedData);
 private slots:
+    void onPlayerApiFinished();
     void onGetHtmlFinished();
     void onSearchFinished();
     void onSuggestionsFinished();
@@ -51,9 +53,20 @@ private slots:
     void onTrendingFinished();
 private:
     static QMap<QString, ScriptData> cachedScripts;
+
+    // Pending results — we fire two parallel requests for video play,
+    // and emit only when both arrive.
+    QMap<QString, VideoMetadata> pendingVideoMetadata;
+    QMap<QString, StorageData>   pendingStorageData;
+
     void search(QString text);
     void parse(QString videoId);
+    void tryEmitMetadata(const QString &videoId);
+
     QNetworkRequest prepareRequest(QString url);
+    void applyInnerTubeHeaders(QNetworkRequest &request);
+    bool hasHttpError(QNetworkReply *reply, QString *errorMessage);
+    QString extractBaseJsUrl(const QString &html);
     QString getJson(QString response);
     QString getApiKey(QString response);
     void onGetBaseJsFinished(QNetworkReply *reply);

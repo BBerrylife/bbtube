@@ -4,6 +4,45 @@
 
 #include <bb/data/JsonDataAccess>
 
+// RecommendedPageParser: parses InnerTube /browse?browseId=FEwhat_to_watch
+// (the home/"recommended" feed) responses.
+//
+// KEY FIXES vs. the original (2021) implementation:
+//  - "tabs.toList()[0]" is now bounds-checked (an empty tabs list used to
+//    crash via out-of-bounds access).
+//  - richGridRenderer is sometimes nested one level deeper inside a
+//    sectionListRenderer wrapper on certain account/locale variants; we now
+//    check both shapes.
+//  - clientVersion parsing kept as a best-effort fallback, but
+//    YoutubeClient.cpp no longer depends on it being correct since it now
+//    uses a fixed known-good version for continuation requests.
+
+static QVariantMap firstOrEmpty(const QVariantList &list)
+{
+    return list.isEmpty() ? QVariantMap() : list[0].toMap();
+}
+
+static QVariantMap extractRichGridRenderer(const QVariantMap &map)
+{
+    QVariantList tabs =
+            map["contents"].toMap()["twoColumnBrowseResultsRenderer"].toMap()["tabs"].toList();
+    QVariantMap firstTab = firstOrEmpty(tabs);
+    QVariantMap tabContent = firstTab["tabRenderer"].toMap()["content"].toMap();
+
+    QVariantMap richGrid = tabContent["richGridRenderer"].toMap();
+    if (!richGrid.isEmpty()) {
+        return richGrid;
+    }
+
+    // Fallback: richGridRenderer nested inside a sectionListRenderer
+    QVariantList sectionContents = tabContent["sectionListRenderer"].toMap()["contents"].toList();
+    QVariantMap firstSection = firstOrEmpty(sectionContents);
+    QVariantList itemSectionContents = firstSection["itemSectionRenderer"].toMap()["contents"].toList();
+    QVariantMap firstItemSection = firstOrEmpty(itemSectionContents);
+
+    return firstItemSection["richGridRenderer"].toMap();
+}
+
 void RecommendedPageParser::parse(RecommendedData *recommendedData, QString *json)
 {
     bb::data::JsonDataAccess jda;
@@ -25,7 +64,6 @@ void RecommendedPageParser::parse(RecommendedData *recommendedData, QString *jso
 
             if (map2["key"].toString() == "cver") {
                 recommendedData->clientVersion = map2["value"].toString();
-
                 break;
             }
         }
@@ -35,8 +73,7 @@ void RecommendedPageParser::parse(RecommendedData *recommendedData, QString *jso
         }
     }
 
-    QVariantMap gridRendererMap =
-            map["contents"].toMap()["twoColumnBrowseResultsRenderer"].toMap()["tabs"].toList()[0].toMap()["tabRenderer"].toMap()["content"].toMap()["richGridRenderer"].toMap();
+    QVariantMap gridRendererMap = extractRichGridRenderer(map);
     QVariantList videosList = gridRendererMap["contents"].toList();
 
     for (int i = 0; i < videosList.count(); i++) {
@@ -50,11 +87,11 @@ void RecommendedPageParser::parse(RecommendedData *recommendedData, QString *jso
             }
 
             SingleVideoMetadata video = ItemRendererParser::getVideo(&videoMap);
-
             recommendedData->videos.append(video);
         } else if (item.contains("continuationItemRenderer")) {
             recommendedData->ctoken =
-                    item["continuationItemRenderer"].toMap()["continuationEndpoint"].toMap()["continuationCommand"].toMap()["token"].toString();
+                    item["continuationItemRenderer"].toMap()["continuationEndpoint"].toMap()
+                    ["continuationCommand"].toMap()["token"].toString();
         }
     }
 }
@@ -69,8 +106,9 @@ void RecommendedPageParser::parseNextBatch(RecommendedData *recommendedData, QSt
         return;
     }
 
+    QVariantMap firstAction = receivedActions[0].toMap();
     QVariantList videosList =
-            receivedActions[0].toMap()["appendContinuationItemsAction"].toMap()["continuationItems"].toList();
+            firstAction["appendContinuationItemsAction"].toMap()["continuationItems"].toList();
 
     for (int i = 0; i < videosList.count(); i++) {
         QVariantMap item = videosList[i].toMap();
@@ -83,11 +121,11 @@ void RecommendedPageParser::parseNextBatch(RecommendedData *recommendedData, QSt
             }
 
             SingleVideoMetadata video = ItemRendererParser::getVideo(&videoMap);
-
             recommendedData->videos.append(video);
         } else if (item.contains("continuationItemRenderer")) {
             recommendedData->ctoken =
-                    item["continuationItemRenderer"].toMap()["continuationEndpoint"].toMap()["continuationCommand"].toMap()["token"].toString();
+                    item["continuationItemRenderer"].toMap()["continuationEndpoint"].toMap()
+                    ["continuationCommand"].toMap()["token"].toString();
         }
     }
 }
