@@ -32,6 +32,28 @@ static const QString INNERTUBE_CLIENT_VERSION = "2.20240101.00.00";
 static const QString INNERTUBE_CLIENT_NAME    = "WEB";
 static const QString INNERTUBE_API_URL_BASE   = "https://www.youtube.com/youtubei/v1/";
 
+// ANDROID client context used ONLY for the /player endpoint (gets us
+// non-throttled, non-ciphered stream URLs without needing the signature
+// decipher pipeline). This MUST stay internally consistent: the ?key=,
+// the clientVersion in the JSON body, and the X-YouTube-Client-Name/
+// X-YouTube-Client-Version headers must all describe the SAME client.
+// Mixing an ANDROID body with WEB headers (client name "1") is what was
+// originally causing a 400 "Bad Request" on video playback — YouTube
+// validates the header client id against the body client name.
+//
+// clientVersion sourced from yt-dlp's youtube/_base.py INNERTUBE_CLIENTS
+// (the ANDROID entry) on 2026-08-04 — that project tracks YouTube's
+// client-version enforcement closely and is the most reliable reference
+// for "what version still gets accepted right now". An outdated version
+// here doesn't cause an HTTP error; it comes back as HTTP 200 with
+// playabilityStatus.status == "ERROR" / "Watch on the latest version of
+// YouTube", which looks identical to a real unavailable-video response
+// unless you inspect the body (see the QT_DEBUG diagnostic block below).
+// UPDATE THIS VERSION periodically by checking that file.
+static const QString INNERTUBE_ANDROID_CLIENT_VERSION = "21.26.364";
+// X-YouTube-Client-Name id for the ANDROID client (WEB is "1", ANDROID is "3")
+static const QString INNERTUBE_ANDROID_CLIENT_NAME_ID = "3";
+
 // REQUIRED: every InnerTube request must include a ?key= query parameter
 // matching the calling client, or the server replies "400 Bad Request"
 // before even looking at the JSON body. These are long-standing public
@@ -88,23 +110,63 @@ void YoutubeClient::parse(QString videoId)
     // This is far more reliable than scraping HTML and parsing ytInitialData
     QNetworkRequest request(INNERTUBE_API_URL_BASE + "player?key=" + INNERTUBE_API_KEY_ANDROID + "&prettyPrint=false");
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    applyInnerTubeHeaders(request);
+    // NOTE: do NOT call applyInnerTubeHeaders() here — that sets WEB client
+    // headers (X-YouTube-Client-Name: 1), which conflicts with the ANDROID
+    // client body below and causes a 400. Set matching ANDROID headers instead.
+    request.setRawHeader("User-Agent",
+        QString("com.google.android.youtube/%1 (Linux; U; Android 11) gzip")
+            .arg(INNERTUBE_ANDROID_CLIENT_VERSION).toUtf8());
+    request.setRawHeader("X-YouTube-Client-Name", INNERTUBE_ANDROID_CLIENT_NAME_ID.toUtf8());
+    request.setRawHeader("X-YouTube-Client-Version", INNERTUBE_ANDROID_CLIENT_VERSION.toUtf8());
 
+    // NOTE: androidSdkVersion IS required here. Attempting to omit it
+    // ("sdkless" trick, previously used by some yt-dlp forks to dodge the
+    // PO-Token-for-GVS requirement) now gets the /player call itself
+    // rejected outright with playabilityStatus ERROR / "Watch on the
+    // latest version of YouTube" — YouTube tightened validation on the
+    // ANDROID client context and now requires this field to accept the
+    // request at all. Any PO-Token requirement for the actual stream URL
+    // (GVS) is a separate, later concern from getting a valid /player
+    // response in the first place.
+    //
+    // "params":"8AEB" (a fixed, unexplained magic value from the original
+    // implementation) has been REMOVED. Cross-checked against yt-dlp's
+    // current youtube extractor (_video.py, _extract_player_response):
+    // the android client entry has no fixed PLAYER_PARAMS at all, so
+    // yt-dlp sends no "params" field for it. Whatever "8AEB" decoded to
+    // (some old feature/context flag) is very likely what's now getting
+    // this client's /player calls universally rejected with ERROR
+    // "Watch on the latest version of YouTube" regardless of clientVersion
+    // — the version bump alone didn't fix it, which points at the request
+    // shape rather than the version string.
+    //
+    // Added "playbackContext"/"contentCheckOk"/"racyCheckOk", matching
+    // yt-dlp's _generate_player_context(): every real /player call yt-dlp
+    // makes includes these, and this app's request was missing them
+    // entirely.
     QString body = QString(
         "{"
         "\"context\":{"
             "\"client\":{"
                 "\"clientName\":\"ANDROID\","
-                "\"clientVersion\":\"19.09.37\","
+                "\"clientVersion\":\"%2\","
                 "\"androidSdkVersion\":30,"
+                "\"osName\":\"Android\","
+                "\"osVersion\":\"11\","
                 "\"hl\":\"en\","
                 "\"gl\":\"US\""
             "}"
         "},"
         "\"videoId\":\"%1\","
-        "\"params\":\"8AEB\""
+        "\"contentCheckOk\":true,"
+        "\"racyCheckOk\":true,"
+        "\"playbackContext\":{"
+            "\"contentPlaybackContext\":{"
+                "\"html5Preference\":\"HTML5_PREF_WANTS\""
+            "}"
         "}"
-    ).arg(videoId);
+        "}"
+    ).arg(videoId, INNERTUBE_ANDROID_CLIENT_VERSION);
 
     // Store videoId for use in onGetHtmlFinished
     QNetworkReply *playerReply = ApplicationUI::networkManager->post(request, body.toUtf8());
@@ -325,6 +387,25 @@ void YoutubeClient::onPlayerApiFinished()
     StorageData storageData;
     StorageParser::parseFromJson(&storageData, &response);
 
+#ifdef QT_DEBUG
+    // TEMP DIAGNOSTIC: dump the parts of the raw /player response we
+    // actually need, instead of the first N characters (which is all
+    // "responseContext"/visitorData base64 noise and never reaches
+    // playabilityStatus or streamingData).
+    {
+        int psIdx = response.indexOf("\"playabilityStatus\"");
+        int sdIdx = response.indexOf("\"streamingData\"");
+        qDebug() << "=== /player diagnostic for videoId" << videoId << "===";
+        qDebug() << "playabilityStatus snippet:"
+                  << (psIdx >= 0 ? response.mid(psIdx, 400) : "NOT FOUND");
+        qDebug() << "streamingData snippet:"
+                  << (sdIdx >= 0 ? response.mid(sdIdx, 600) : "NOT FOUND");
+        qDebug() << "=== instances:" << storageData.instances.count()
+                  << "audio empty:" << storageData.audio.url.isEmpty()
+                  << storageData.audio.cipher.isEmpty() << "===";
+    }
+#endif
+
     // Decrypt any cipher-protected URLs.
     // NOTE: this check is intentionally NOT nested inside an
     // "instances.count() > 0" guard — a video can have zero progressive/
@@ -391,8 +472,17 @@ void YoutubeClient::onGetHtmlFinished()
 
     QString httpErrorMessage;
     if (reply->error() || hasHttpError(reply, &httpErrorMessage)) {
-        emit error(reply->error() ? reply->errorString() : httpErrorMessage);
-        pendingStorageData.remove(requestedVideoId);
+        // The watch-page GET itself failed at the transport/HTTP level
+        // (e.g. YouTube's consent/bot-check wall responding with a non-2xx
+        // status). This only affects display metadata (title, related
+        // videos) — it says nothing about whether the InnerTube /player
+        // call succeeded. Don't discard a stream URL we may already have;
+        // fall back to minimal metadata instead, same as the empty-parse
+        // case below, so playback isn't blocked by a metadata-only failure.
+        VideoMetadata fallbackMetadata;
+        fallbackMetadata.video.videoId = requestedVideoId;
+        pendingVideoMetadata[requestedVideoId] = fallbackMetadata;
+        tryEmitMetadata(requestedVideoId);
         reply->deleteLater();
         return;
     }
@@ -404,12 +494,19 @@ void YoutubeClient::onGetHtmlFinished()
     ItemRendererParser::populateVideoMetadata(&videoMetadata, &json);
 
     if (videoMetadata.video.videoId.isEmpty()) {
-        emit error("Source unavailable");
-        // Use the videoId we requested with (parsing failed, so
-        // videoMetadata.video.videoId is empty and can't be used as the key).
-        pendingStorageData.remove(requestedVideoId);
-        reply->deleteLater();
-        return;
+        // The watch-page HTML scrape failed to find ytInitialData (YouTube
+        // served a stripped/consent/bot-check page instead of the full
+        // watch page — this is independent of whether the InnerTube
+        // /player call succeeded). Previously this dropped the whole
+        // video, including a perfectly good stream URL already sitting in
+        // pendingStorageData, and reported "Source unavailable" even
+        // though playback would have worked fine.
+        //
+        // Instead: fall back to a minimal metadata object using the
+        // videoId we requested with, so playback can still proceed. The
+        // user just loses the nicer title/related-videos data for this
+        // load; the video itself still plays.
+        videoMetadata.video.videoId = requestedVideoId;
     }
 
     pendingVideoMetadata[videoMetadata.video.videoId] = videoMetadata;
