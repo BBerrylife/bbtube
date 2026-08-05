@@ -110,7 +110,7 @@ void InfoSheet::onBBerryLifeTouch(bb::cascades::TouchEvent *event)
     bb::system::InvokeRequest request;
     request.setAction("bb.action.OPEN");
     request.setTarget("sys.browser");
-    request.setUri("https://www.facebook.com/BBerryLife");
+    request.setUri("https://bberrylife.github.io");
 
     bb::system::InvokeTargetReply* reply = (new bb::system::InvokeManager)->invoke(request);
     reply->deleteLater();

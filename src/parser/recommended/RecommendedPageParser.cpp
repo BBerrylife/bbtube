@@ -4,6 +4,7 @@
 
 #include <bb/data/JsonDataAccess>
 #include <QDebug>
+#include <QStringList>
 
 // Simple recursive dumper for debugging unknown JSON shapes, without
 // depending on any JsonDataAccess serialization API.
@@ -47,6 +48,25 @@ static void dumpVariant(const QVariant &value, const QString &path, int depth)
 static QVariantMap firstOrEmpty(const QVariantList &list)
 {
     return list.isEmpty() ? QVariantMap() : list[0].toMap();
+}
+
+// Local copy of the simpleText/runs normalizer (kept private to this file
+// to avoid widening ItemRendererParser's public surface just for this one
+// use in the feed-nudge message).
+static QString getSimpleOrRunText(const QVariantMap &textObject)
+{
+    if (textObject.contains("simpleText")) {
+        return textObject["simpleText"].toString();
+    }
+    if (textObject.contains("runs")) {
+        QVariantList runs = textObject["runs"].toList();
+        QStringList parts;
+        for (int i = 0; i < runs.count(); i++) {
+            parts.append(runs[i].toMap()["text"].toString());
+        }
+        return parts.join("");
+    }
+    return QString();
 }
 
 static QVariantMap extractRichGridRenderer(const QVariantMap &map)
@@ -125,6 +145,18 @@ void RecommendedPageParser::parse(RecommendedData *recommendedData, QString *jso
                 shelfItems = sectionContent["richShelfRenderer"].toMap()["contents"].toList();
             } else if (sectionContent.contains("richGridRenderer")) {
                 shelfItems = sectionContent["richGridRenderer"].toMap()["contents"].toList();
+            } else if (sectionContent.contains("feedNudgeRenderer")) {
+                // YouTube returns this instead of real recommendations for a
+                // fresh/anonymous session with no watch history to
+                // personalize from. Surface the message it gives us.
+                QVariantMap feedNudge = sectionContent["feedNudgeRenderer"].toMap();
+                QString title = getSimpleOrRunText(feedNudge["title"].toMap());
+                QString subtitle = getSimpleOrRunText(feedNudge["subtitle"].toMap());
+
+                if (recommendedData->emptyFeedMessage.isEmpty()) {
+                    recommendedData->emptyFeedMessage =
+                            !subtitle.isEmpty() ? subtitle : title;
+                }
             }
 
             if (i == 0) {

@@ -23,6 +23,8 @@
 #include <QtNetwork/QNetworkCookie>
 #include <QtNetwork/QNetworkCookieJar>
 #include <QtCore/QDate>
+#include <QDebug>
+#include <bb/data/JsonDataAccess>
 
 QMap<QString, ScriptData> YoutubeClient::cachedScripts;
 
@@ -60,6 +62,18 @@ static const QString INNERTUBE_ANDROID_CLIENT_NAME_ID = "3";
 // client keys embedded in YouTube's own web/Android clients (not secrets).
 static const QString INNERTUBE_API_KEY_WEB     = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 static const QString INNERTUBE_API_KEY_ANDROID = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+
+// YouTube Charts (charts.youtube.com) — replaces the classic Trending page
+// (browseId FEtrending), which YouTube shut down in July 2025. Charts runs
+// on a completely separate subdomain/InnerTube client from the rest of the
+// app, confirmed from that page's actual browser network request (DevTools,
+// 2026-08-05): no ?key= query param is used here (unlike the www.youtube.com
+// endpoints above); auth instead relies on the request being same-origin to
+// charts.youtube.com.
+static const QString CHARTS_API_URL_BASE    = "https://charts.youtube.com/youtubei/v1/";
+static const QString CHARTS_CLIENT_NAME     = "WEB_MUSIC_ANALYTICS";
+static const QString CHARTS_CLIENT_VERSION  = "2.0";
+static const QString CHARTS_CLIENT_ID       = "31"; // X-Youtube-Client-Name value
 
 // NOTE: request bodies are built inline via QString::arg() in each method
 // below (parse/search/channel/recommended/trending) rather than through a
@@ -330,40 +344,43 @@ void YoutubeClient::recommendedNextBatch(RecommendedData *recommendedData)
 
 void YoutubeClient::trending(QString categoryKey)
 {
-    // Use InnerTube /browse?browseId=FEtrending for trending
-    QNetworkRequest request(INNERTUBE_API_URL_BASE + "browse?key=" + INNERTUBE_API_KEY_WEB + "&prettyPrint=false");
-    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
-    applyInnerTubeHeaders(request);
+    // As of July 2025, YouTube removed the classic Trending page/browseId
+    // (FEtrending) entirely, replacing it with category-specific "Charts"
+    // served from a *separate* domain (charts.youtube.com) using a
+    // dedicated InnerTube client ("WEB_MUSIC_ANALYTICS", client id 31) —
+    // captured directly from that page's real network request. categoryKey
+    // is now the chart_params_chart_type value (e.g. "TRENDING_VIDEOS",
+    // "PODCAST_SHOWS", "MOVIE_TRAILERS"), defaulting to TRENDING_VIDEOS.
+    QString chartType = categoryKey.isEmpty() ? "TRENDING_VIDEOS" : categoryKey;
 
-    QString body;
-    if (categoryKey.isEmpty()) {
-        body = QString(
-            "{"
-            "\"context\":{"
-                "\"client\":{"
-                    "\"clientName\":\"%1\","
-                    "\"clientVersion\":\"%2\","
-                    "\"hl\":\"en\",\"gl\":\"US\""
-                "}"
+    qDebug() << "[bbtube][trending] trending() called, chartType =" << chartType;
+
+    QNetworkRequest request(CHARTS_API_URL_BASE + "browse?alt=json");
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    applyChartsHeaders(request);
+
+    QString body = QString(
+        "{"
+        "\"context\":{"
+            "\"capabilities\":{},"
+            "\"client\":{"
+                "\"clientName\":\"%1\","
+                "\"clientVersion\":\"%2\","
+                "\"hl\":\"en\",\"gl\":\"US\","
+                "\"experimentIds\":[],\"experimentsToken\":\"\","
+                "\"theme\":\"MUSIC\""
             "},"
-            "\"browseId\":\"FEtrending\""
-            "}"
-        ).arg(INNERTUBE_CLIENT_NAME, INNERTUBE_CLIENT_VERSION);
-    } else {
-        body = QString(
-            "{"
-            "\"context\":{"
-                "\"client\":{"
-                    "\"clientName\":\"%1\","
-                    "\"clientVersion\":\"%2\","
-                    "\"hl\":\"en\",\"gl\":\"US\""
-                "}"
-            "},"
-            "\"browseId\":\"FEtrending\","
-            "\"params\":\"%3\""
-            "}"
-        ).arg(INNERTUBE_CLIENT_NAME, INNERTUBE_CLIENT_VERSION, categoryKey);
-    }
+            "\"request\":{\"internalExperimentFlags\":[]}"
+        "},"
+        "\"browseId\":\"FEmusic_analytics_charts_home\","
+        "\"query\":\"flags=MusicCharts__enable_apac_and_shorts_charts_expansion"
+            "&perspective=CHART_DETAILS"
+            "&chart_params_country_code=us"
+            "&chart_params_chart_type=%3\""
+        "}"
+    ).arg(CHARTS_CLIENT_NAME, CHARTS_CLIENT_VERSION, chartType);
+
+    qDebug() << "[bbtube][trending] request body =" << body;
 
     QNetworkReply *reply = ApplicationUI::networkManager->post(request, body.toUtf8());
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onTrendingFinished()));
@@ -406,6 +423,32 @@ void YoutubeClient::onPlayerApiFinished()
         qDebug() << "=== instances:" << storageData.instances.count()
                   << "audio empty:" << storageData.audio.url.isEmpty()
                   << storageData.audio.cipher.isEmpty() << "===";
+
+        // List every itag/qualityLabel/mimeType available in this response
+        // (both progressive "formats" and "adaptiveFormats"), so we can see
+        // exactly which resolutions YouTube is offering for this specific
+        // video without re-parsing the whole JSON by hand.
+        bb::data::JsonDataAccess diagJda;
+        QVariantMap diagMap = diagJda.loadFromBuffer(response).toMap();
+        QVariantMap diagStreamingData = diagMap["streamingData"].toMap();
+
+        QVariantList diagFormats = diagStreamingData["formats"].toList();
+        qDebug() << "[bbtube][player] formats (progressive) count =" << diagFormats.count();
+        for (int i = 0; i < diagFormats.count(); i++) {
+            QVariantMap f = diagFormats[i].toMap();
+            qDebug() << "[bbtube][player]  formats[" << i << "] itag =" << f["itag"].toInt()
+                     << ", qualityLabel =" << f["qualityLabel"].toString()
+                     << ", mimeType =" << f["mimeType"].toString();
+        }
+
+        QVariantList diagAdaptive = diagStreamingData["adaptiveFormats"].toList();
+        qDebug() << "[bbtube][player] adaptiveFormats count =" << diagAdaptive.count();
+        for (int i = 0; i < diagAdaptive.count(); i++) {
+            QVariantMap f = diagAdaptive[i].toMap();
+            qDebug() << "[bbtube][player]  adaptiveFormats[" << i << "] itag =" << f["itag"].toInt()
+                     << ", qualityLabel =" << f["qualityLabel"].toString()
+                     << ", mimeType =" << f["mimeType"].toString();
+        }
     }
 #endif
 
@@ -716,16 +759,32 @@ void YoutubeClient::onTrendingFinished()
 {
     QNetworkReply *reply = static_cast<QNetworkReply*>(QObject::sender());
 
+    qDebug() << "[bbtube][trending] onTrendingFinished, HTTP status ="
+             << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
     QString httpErrorMessage;
     if (reply->error() || hasHttpError(reply, &httpErrorMessage)) {
+        // Read the body even on error — YouTube usually returns a JSON
+        // error payload (error.code / error.message / error.status)
+        // explaining *why* the request was rejected, which is far more
+        // useful than the generic "Bad Request" Qt/HTTP reason phrase.
+        QString errorBody = QString(reply->readAll());
+        qDebug() << "[bbtube][trending] error:"
+                 << (reply->error() ? reply->errorString() : httpErrorMessage);
+        qDebug() << "[bbtube][trending] error response body =" << errorBody.left(2000);
         emit error(reply->error() ? reply->errorString() : httpErrorMessage);
         reply->deleteLater();
         return;
     }
 
     QString response = QString(reply->readAll());
+    qDebug() << "[bbtube][trending] response length =" << response.length();
+
     TrendingData trendingData;
     TrendingPageParser::parse(&trendingData, &response);
+
+    qDebug() << "[bbtube][trending] parsed videos.count() =" << trendingData.videos.count();
+
     emit trendingDataReceived(trendingData);
     reply->deleteLater();
 }
@@ -774,6 +833,20 @@ void YoutubeClient::applyInnerTubeHeaders(QNetworkRequest &request)
     request.setRawHeader("X-YouTube-Client-Version", INNERTUBE_CLIENT_VERSION.toUtf8());
     request.setRawHeader("Origin", "https://www.youtube.com");
     request.setRawHeader("Referer", "https://www.youtube.com/");
+}
+
+// Headers for charts.youtube.com requests — this is a different origin
+// from www.youtube.com, with its own client id/name, so it cannot reuse
+// applyInnerTubeHeaders() (which hardcodes the www.youtube.com origin and
+// the WEB client id "1"). Captured from the real browser request.
+void YoutubeClient::applyChartsHeaders(QNetworkRequest &request)
+{
+    request.setRawHeader("User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0");
+    request.setRawHeader("X-YouTube-Client-Name", CHARTS_CLIENT_ID.toUtf8());
+    request.setRawHeader("X-YouTube-Client-Version", CHARTS_CLIENT_VERSION.toUtf8());
+    request.setRawHeader("Origin", "https://charts.youtube.com");
+    request.setRawHeader("Referer", "https://charts.youtube.com/charts/TrendingVideos/us");
 }
 
 // QNetworkReply::error() only flags network-level failures (DNS, timeout,

@@ -15,6 +15,7 @@
 #include <bb/cascades/Container>
 #include <bb/cascades/ListView>
 #include <bb/cascades/NavigationPane>
+#include <bb/cascades/Label>
 #include <QVariantList>
 
 class RecommendedPage: public BasePage
@@ -33,6 +34,7 @@ private slots:
 private:
     RecommendedData recommendedData;
     CustomListView *videoList;
+    bb::cascades::Label *emptyFeedLabel;
     static int pageSize;
     bool isLoaded;
 

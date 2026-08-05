@@ -24,6 +24,7 @@
 #include <bb/cascades/UIConfig>
 #include <bb/cascades/ActionItem>
 #include <bb/cascades/Shortcut>
+#include <bb/cascades/TextAlign>
 #include <QVariantList>
 #include <QDebug>
 
@@ -45,6 +46,14 @@ RecommendedPage::RecommendedPage(bb::cascades::NavigationPane *navigationPane) :
             new RecommendedPageListItemActionSetBuilder());
     videoList->setListItemProvider(listProvider);
     container->add(videoList);
+
+    emptyFeedLabel = bb::cascades::Label::create().multiline(true);
+    emptyFeedLabel->setVerticalAlignment(bb::cascades::VerticalAlignment::Center);
+    emptyFeedLabel->setHorizontalAlignment(bb::cascades::HorizontalAlignment::Center);
+    emptyFeedLabel->textStyle()->setTextAlign(bb::cascades::TextAlign::Center);
+    emptyFeedLabel->setVisible(false);
+    container->add(emptyFeedLabel);
+
     root->add(container);
 
     root->add(overlay);
@@ -144,9 +153,23 @@ void RecommendedPage::onPlayAudioOnlyActionItemClick(QVariantList indexPath)
 void RecommendedPage::onRecommendedDataReceived(RecommendedData data)
 {
     qDebug() << "[bbtube][RecommendedPage] onRecommendedDataReceived, videos.count() ="
-             << data.videos.count();
+             << data.videos.count() << ", emptyFeedMessage =" << data.emptyFeedMessage;
 
     recommendedData = data;
+
+    if (recommendedData.videos.isEmpty()) {
+        videoList->setVisible(false);
+        emptyFeedLabel->setText(
+                !recommendedData.emptyFeedMessage.isEmpty() ?
+                        recommendedData.emptyFeedMessage :
+                        "No recommendations available. Try Search or Trending instead.");
+        emptyFeedLabel->setVisible(true);
+        overlay->setVisible(false);
+        return;
+    }
+
+    videoList->setVisible(true);
+    emptyFeedLabel->setVisible(false);
 
     QListDataModel<VideoListItemModel*> *model = new QListDataModel<VideoListItemModel*>();
     for (int i = 0; i < pageSize && i < recommendedData.videos.count(); i++) {
@@ -187,6 +210,8 @@ void RecommendedPage::onChannelDataReceived(ChannelPageData data)
 void RecommendedPage::onRefreshActionItemClick()
 {
     overlay->setVisible(true);
+    emptyFeedLabel->setVisible(false);
+    videoList->setVisible(true);
     isLoaded = true;
     youtubeClient->recommended();
 }
