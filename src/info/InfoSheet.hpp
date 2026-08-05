@@ -5,6 +5,7 @@
 
 #include <QObject>
 #include <bb/cascades/Sheet>
+#include <bb/cascades/TouchEvent>
 
 using namespace bb::cascades;
 
@@ -19,6 +20,7 @@ public:
 private slots:
     void onCrackberryActionItemClick();
     void onDonateActionItemClick();
+    void onBBerryLifeTouch(bb::cascades::TouchEvent *event);
 };
 
 

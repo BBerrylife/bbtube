@@ -9,7 +9,12 @@
 #include <bb/cascades/UIConfig>
 #include <bb/cascades/SystemDefaults>
 #include <bb/cascades/VerticalAlignment>
+#include <bb/cascades/HorizontalAlignment>
 #include <bb/cascades/ActionItem>
+#include <bb/cascades/Color>
+#include <bb/cascades/TouchType>
+#include <bb/cascades/StackLayout>
+#include <bb/cascades/LayoutOrientation>
 #include <bb/system/InvokeRequest>
 #include <bb/system/InvokeTargetReply>
 #include <bb/system/InvokeManager>
@@ -32,6 +37,24 @@ InfoSheet::InfoSheet() :
     container->add(
             Label::create().multiline(true).text(
                     "If you want to donate please leave [BBTube] tag in the comments field.\nThank you."));
+
+    Container *maintainerContainer = Container::create();
+    maintainerContainer->setLayout(StackLayout::create().orientation(LayoutOrientation::LeftToRight));
+
+    Label *maintainerLabel = Label::create().multiline(true).text("The application is maintained by ");
+
+    Container *bberryLifeLinkContainer = Container::create();
+    Label *bberryLifeLabel = Label::create().multiline(true).text("BBerryLife");
+    bberryLifeLabel->textStyle()->setColor(Color::fromARGB(0xffff0000));
+    bberryLifeLinkContainer->add(bberryLifeLabel);
+
+    maintainerContainer->add(maintainerLabel);
+    maintainerContainer->add(bberryLifeLinkContainer);
+    container->add(maintainerContainer);
+
+    QObject::connect(bberryLifeLinkContainer, SIGNAL(touch(bb::cascades::TouchEvent *)), this,
+            SLOT(onBBerryLifeTouch(bb::cascades::TouchEvent *)));
+
     TitleBar *titleBar = new TitleBar(TitleBarKind::Default);
     ActionItem *closeAction = ActionItem::create().title("Back");
     QObject::connect(closeAction, SIGNAL(triggered()), this, SLOT(closeActionClick()));
@@ -73,6 +96,21 @@ void InfoSheet::onDonateActionItemClick()
     request.setAction("bb.action.OPEN");
     request.setTarget("sys.browser");
     request.setUri("https://paypal.me/nagmet");
+
+    bb::system::InvokeTargetReply* reply = (new bb::system::InvokeManager)->invoke(request);
+    reply->deleteLater();
+}
+
+void InfoSheet::onBBerryLifeTouch(bb::cascades::TouchEvent *event)
+{
+    if (event->touchType() != bb::cascades::TouchType::Up) {
+        return;
+    }
+
+    bb::system::InvokeRequest request;
+    request.setAction("bb.action.OPEN");
+    request.setTarget("sys.browser");
+    request.setUri("https://www.facebook.com/BBerryLife");
 
     bb::system::InvokeTargetReply* reply = (new bb::system::InvokeManager)->invoke(request);
     reply->deleteLater();

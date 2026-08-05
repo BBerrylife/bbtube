@@ -28,6 +28,7 @@
 #include <bb/cascades/StackLayoutProperties>
 #include <bb/cascades/LayoutOrientation>
 #include <bb/cascades/Label>
+#include <QDebug>
 #include <bb/cascades/ListView>
 #include <bb/cascades/SystemDefaults>
 #include <bb/cascades/ActionItem>
@@ -234,6 +235,8 @@ void ChannelListPage::onRemoveFromChannelsActionItemClick(QVariantList indexPath
 
 void ChannelListPage::onChannelDataReceived(ChannelPageData channelData)
 {
+    qDebug() << "[bbtube][ChannelListPage] onChannelDataReceived, videos.count() ="
+             << channelData.videos.count() << " (BUILD MARKER v2)";
     navigationPane->push(new ChannelPage(channelData, navigationPane));
     overlay->setVisible(false);
     channelList->setEnabled(true);

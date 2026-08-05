@@ -28,12 +28,16 @@
 #include <QVariantList>
 #include <bb/system/Clipboard>
 #include <bb/cascades/Color>
+#include <QDebug>
 
 int ChannelPage::pageSize = 12;
 
 ChannelPage::ChannelPage(ChannelPageData channelData, bb::cascades::NavigationPane *navigationPane) :
         BasePage(navigationPane), channelData(channelData)
 {
+    qDebug() << "[bbtube][ChannelPage] ctor entered, channelData.title =" << channelData.title
+             << ", channelData.videos.count() =" << channelData.videos.count();
+
     bb::cascades::Container *container = new bb::cascades::Container();
     container->setVerticalAlignment(bb::cascades::VerticalAlignment::Fill);
     container->setHorizontalAlignment(bb::cascades::HorizontalAlignment::Fill);
@@ -64,8 +68,13 @@ ChannelPage::ChannelPage(ChannelPageData channelData, bb::cascades::NavigationPa
 
     QListDataModel<VideoListItemModel*> *model = new QListDataModel<VideoListItemModel*>();
 
+    qDebug() << "[bbtube][ChannelPage] building dataModel, pageSize =" << pageSize
+             << ", will map" << qMin(pageSize, channelData.videos.count()) << "items";
+
     for (int i = 0; i < pageSize && i < channelData.videos.count(); i++) {
         VideoListItemModel *item = VideoListItemModel::mapVideo(&channelData.videos[i]);
+        qDebug() << "[bbtube][ChannelPage]  item[" << i << "] id =" << item->id
+                 << ", title =" << item->title() << ", thumbnailUrl =" << item->thumbnailUrl;
         model->append(item);
     }
 
@@ -75,7 +84,12 @@ ChannelPage::ChannelPage(ChannelPageData channelData, bb::cascades::NavigationPa
         model->append(item);
     }
 
+    qDebug() << "[bbtube][ChannelPage] model->size() after build =" << model->size();
+
     videoList->setDataModel(model);
+
+    qDebug() << "[bbtube][ChannelPage] videoList->dataModel() set, dataModel() null? ="
+             << (videoList->dataModel() == 0);
 
     bb::cascades::ActionItem *copyChannelLinkActionItem =
             ActionItemService::copyChannelLinkActionItem(this);

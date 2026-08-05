@@ -286,6 +286,8 @@ void YoutubeClient::channelVideosNextBatch(ChannelPageData *channelData)
 
 void YoutubeClient::recommended()
 {
+    qDebug() << "[bbtube][recommended] recommended() called";
+
     // Use InnerTube /browse?browseId=FEwhat_to_watch for the homepage/recommended feed
     QNetworkRequest request(INNERTUBE_API_URL_BASE + "browse?key=" + INNERTUBE_API_KEY_WEB + "&prettyPrint=false");
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
@@ -305,6 +307,7 @@ void YoutubeClient::recommended()
     ).arg(INNERTUBE_CLIENT_NAME, INNERTUBE_CLIENT_VERSION);
 
     QNetworkReply *reply = ApplicationUI::networkManager->post(request, body.toUtf8());
+    qDebug() << "[bbtube][recommended] request posted to" << request.url().toString();
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onRecommendedFinished()));
 }
 
@@ -592,14 +595,22 @@ void YoutubeClient::onChannelFinished()
 {
     QNetworkReply *reply = static_cast<QNetworkReply*>(QObject::sender());
 
+    qDebug() << "[bbtube][channel] onChannelFinished, HTTP status ="
+             << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
     QString httpErrorMessage;
     if (reply->error() || hasHttpError(reply, &httpErrorMessage)) {
+        qDebug() << "[bbtube][channel] request-level error:"
+                  << (reply->error() ? reply->errorString() : httpErrorMessage);
         emit error(reply->error() ? reply->errorString() : httpErrorMessage);
         reply->deleteLater();
         return;
     }
 
     QString response = QString(reply->readAll());
+
+    qDebug() << "[bbtube][channel] response length =" << response.length();
+    qDebug() << "[bbtube][channel] response head =" << response.left(500);
 
     ChannelPageData channelData;
     // clientVersion now extracted from the InnerTube response itself
@@ -613,15 +624,24 @@ void YoutubeClient::onChannelFinished()
 
     ChannelPageParser::parse(&channelData, &response);
 
+    qDebug() << "[bbtube][channel] parsed title =" << channelData.title
+             << ", redirectChannelId =" << channelData.redirectChannelId
+             << ", videos.count() =" << channelData.videos.count()
+             << ", ctoken empty =" << channelData.ctoken.isEmpty();
+
     if (!channelData.redirectChannelId.isEmpty()) {
+        qDebug() << "[bbtube][channel] following redirect to" << channelData.redirectChannelId;
         channel(channelData.redirectChannelId, channelData.channelId);
         reply->deleteLater();
         return;
     }
 
     if (!channelData.title.isEmpty()) {
+        qDebug() << "[bbtube][channel] EMITTING channelDataReceived, videos.count() ="
+                 << channelData.videos.count() << " (BUILD MARKER v2)";
         emit channelDataReceived(channelData);
     } else {
+        qDebug() << "[bbtube][channel] title empty -> emitting 'Channel not found'";
         emit error("Channel not found");
     }
 
@@ -649,17 +669,28 @@ void YoutubeClient::onRecommendedFinished()
 {
     QNetworkReply *reply = static_cast<QNetworkReply*>(QObject::sender());
 
+    qDebug() << "[bbtube][recommended] onRecommendedFinished, HTTP status ="
+             << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+
     QString httpErrorMessage;
     if (reply->error() || hasHttpError(reply, &httpErrorMessage)) {
+        qDebug() << "[bbtube][recommended] error:"
+                 << (reply->error() ? reply->errorString() : httpErrorMessage);
         emit error(reply->error() ? reply->errorString() : httpErrorMessage);
         reply->deleteLater();
         return;
     }
 
     QString response = QString(reply->readAll());
+    qDebug() << "[bbtube][recommended] response length =" << response.length();
+
     RecommendedData recommendedData;
     recommendedData.clientVersion = INNERTUBE_CLIENT_VERSION;
     RecommendedPageParser::parse(&recommendedData, &response);
+
+    qDebug() << "[bbtube][recommended] parsed videos.count() =" << recommendedData.videos.count()
+             << ", ctoken empty =" << recommendedData.ctoken.isEmpty();
+
     emit recommendedDataReceived(recommendedData);
     reply->deleteLater();
 }

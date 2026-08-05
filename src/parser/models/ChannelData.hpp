@@ -3,6 +3,8 @@
 
 #include "VideoMetadata.hpp"
 
+#include <QMetaType>
+
 class ChannelData
 {
 public:
@@ -20,5 +22,7 @@ public:
     QString ctoken;
     QString apiKey;
 };
+
+Q_DECLARE_METATYPE(ChannelPageData)
 
 #endif /* ChannelData_HPP_ */

@@ -1,6 +1,7 @@
 #include "applicationui.hpp"
 #include "src/parser/YoutubeClient.hpp"
 #include "src/parser/models/VideoMetadata.hpp"
+#include "src/parser/models/ChannelData.hpp"
 #include "src/BrowseTab/BrowseTab.hpp"
 #include "src/StartPage/StartPage.hpp"
 #include "src/ChannelsTab/ChannelsTab.hpp"
@@ -104,6 +105,7 @@ ApplicationUI::ApplicationUI() :
     PlaybackTimeoutHandler *playbackTimeoutHandler = new PlaybackTimeoutHandler(this);
 
     qRegisterMetaType<bb::multimedia::MediaState::Type>("bb::multimedia::MediaState::Type");
+    qRegisterMetaType<ChannelPageData>("ChannelPageData");
     audio_manager_events_required = true;
     QFuture<void> *_future = new QFuture<void>;
     QFutureWatcher<void> *_watcher = new QFutureWatcher<void>;

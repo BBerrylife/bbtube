@@ -370,6 +370,98 @@ public:
         return data;
     }
 
+    // Extract the plain-text "duration" badge from a lockupViewModel's
+    // thumbnail overlays (thumbnailBottomOverlayViewModel.badges[]), if
+    // present. YouTube's badge shape varies slightly, so we look for a
+    // nested "text" string inside each badge rather than a single fixed path.
+    static QString extractLockupDuration(const QVariantMap &lockupViewModel)
+    {
+        QVariantList overlays = lockupViewModel["contentImage"].toMap()["thumbnailViewModel"]
+                .toMap()["overlays"].toList();
+
+        for (int i = 0; i < overlays.count(); i++) {
+            QVariantMap overlay = overlays[i].toMap();
+            if (!overlay.contains("thumbnailBottomOverlayViewModel")) {
+                continue;
+            }
+
+            QVariantList badges =
+                    overlay["thumbnailBottomOverlayViewModel"].toMap()["badges"].toList();
+            for (int j = 0; j < badges.count(); j++) {
+                QVariantMap badge = badges[j].toMap();
+                // Common shape: { "thumbnailBadgeViewModel": { "text": "12:34" } }
+                foreach(const QString &key, badge.keys()) {
+                    QVariantMap inner = badge[key].toMap();
+                    if (inner.contains("text")) {
+                        return inner["text"].toString();
+                    }
+                }
+            }
+        }
+
+        return QString();
+    }
+
+    // Extract subtitle text parts (views count, upload date, etc.) from a
+    // lockupViewModel's metadataRows. Each row has "metadataParts", and each
+    // part typically nests a "text": { "content": "..." }.
+    static QStringList extractLockupMetadataParts(const QVariantMap &lockupViewModel)
+    {
+        QStringList parts;
+
+        QVariantList metadataRows = lockupViewModel["metadata"].toMap()["lockupMetadataViewModel"]
+                .toMap()["metadata"].toMap()["contentMetadataViewModel"].toMap()
+                ["metadataRows"].toList();
+
+        for (int i = 0; i < metadataRows.count(); i++) {
+            QVariantList metadataParts = metadataRows[i].toMap()["metadataParts"].toList();
+
+            for (int j = 0; j < metadataParts.count(); j++) {
+                QVariantMap part = metadataParts[j].toMap();
+                QString text = part["text"].toMap()["content"].toString();
+                if (!text.isEmpty()) {
+                    parts.append(text);
+                }
+            }
+        }
+
+        return parts;
+    }
+
+public:
+    // Parse a "lockupViewModel" (YouTube's newer View Model architecture,
+    // which has replaced "videoRenderer" in channel/home video grids as of
+    // ~2025) into a SingleVideoMetadata. Shared by ChannelPageParser and
+    // RecommendedPageParser (and any other caller hitting the new shape).
+    static SingleVideoMetadata getVideoFromLockup(const QVariantMap &lockupViewModel)
+    {
+        SingleVideoMetadata data;
+
+        data.videoId = lockupViewModel["contentId"].toString();
+
+        QVariantMap metadataViewModel =
+                lockupViewModel["metadata"].toMap()["lockupMetadataViewModel"].toMap();
+        data.title = metadataViewModel["title"].toMap()["content"].toString();
+
+        QVariantList sources = lockupViewModel["contentImage"].toMap()["thumbnailViewModel"]
+                .toMap()["image"].toMap()["sources"].toList();
+        if (!sources.isEmpty()) {
+            data.thumbnailUrl = sources.last().toMap()["url"].toString();
+        }
+
+        data.lengthText = extractLockupDuration(lockupViewModel);
+
+        QStringList metadataParts = extractLockupMetadataParts(lockupViewModel);
+        if (metadataParts.count() > 0) {
+            data.shortViewsCount = metadataParts[0];
+        }
+        if (metadataParts.count() > 1) {
+            data.dateUploadedAgo = metadataParts[1];
+        }
+
+        return data;
+    }
+
     // Public wrapper retained for backward source-compatibility with
     // callers in RecommendedPageParser / TrendingPageParser that pass a
     // "videoRenderer" map (search/home-grid style).

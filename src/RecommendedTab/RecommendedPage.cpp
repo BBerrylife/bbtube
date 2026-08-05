@@ -25,6 +25,7 @@
 #include <bb/cascades/ActionItem>
 #include <bb/cascades/Shortcut>
 #include <QVariantList>
+#include <QDebug>
 
 int RecommendedPage::pageSize = 12;
 
@@ -142,6 +143,9 @@ void RecommendedPage::onPlayAudioOnlyActionItemClick(QVariantList indexPath)
 
 void RecommendedPage::onRecommendedDataReceived(RecommendedData data)
 {
+    qDebug() << "[bbtube][RecommendedPage] onRecommendedDataReceived, videos.count() ="
+             << data.videos.count();
+
     recommendedData = data;
 
     QListDataModel<VideoListItemModel*> *model = new QListDataModel<VideoListItemModel*>();
@@ -189,6 +193,7 @@ void RecommendedPage::onRefreshActionItemClick()
 
 void RecommendedPage::lazyLoad()
 {
+    qDebug() << "[bbtube][RecommendedPage] lazyLoad() called, isLoaded =" << isLoaded;
     if (!isLoaded) {
         onRefreshActionItemClick();
     }
