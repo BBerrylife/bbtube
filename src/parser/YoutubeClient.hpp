@@ -61,6 +61,7 @@ private:
 
     void search(QString text);
     void parse(QString videoId);
+    QNetworkReply* requestPlayerData(const QString &videoId, int clientIndex);
     void tryEmitMetadata(const QString &videoId);
 
     QNetworkRequest prepareRequest(QString url);

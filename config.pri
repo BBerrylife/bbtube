@@ -142,8 +142,11 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/MiniPlayer.cpp) \
         $$quote($$BASEDIR/src/utils/PlaylistSheet.cpp) \
         $$quote($$BASEDIR/src/utils/PlaylistVideoProxy.cpp) \
+        $$quote($$BASEDIR/src/utils/StreamingRemuxSession.cpp) \
         $$quote($$BASEDIR/src/utils/UIUtils.cpp) \
-        $$quote($$BASEDIR/src/utils/VideoViewedPercentProxy.cpp)
+        $$quote($$BASEDIR/src/utils/VideoViewedPercentProxy.cpp) \
+        $$quote($$BASEDIR/src/utils/mp4_remux.cpp) \
+        $$quote($$BASEDIR/src/utils/mp4_stream_remux.cpp)
 
     HEADERS += \
         $$quote($$BASEDIR/src/BrowseTab/BrowseTab.hpp) \
@@ -216,9 +219,11 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/PlaybackTimeoutHandler.hpp) \
         $$quote($$BASEDIR/src/utils/PlaylistSheet.hpp) \
         $$quote($$BASEDIR/src/utils/PlaylistVideoProxy.hpp) \
+        $$quote($$BASEDIR/src/utils/StreamingRemuxSession.hpp) \
         $$quote($$BASEDIR/src/utils/UIUtils.hpp) \
         $$quote($$BASEDIR/src/utils/UpdatableDataModel.hpp) \
-        $$quote($$BASEDIR/src/utils/VideoViewedPercentProxy.hpp)
+        $$quote($$BASEDIR/src/utils/VideoViewedPercentProxy.hpp) \
+        $$quote($$BASEDIR/src/utils/mp4_stream_remux.hpp)
 }
 
 CONFIG += precompile_header

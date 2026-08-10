@@ -84,6 +84,7 @@ void StorageParser::parseFromJsonInternal(StorageData *storageData,
         video.quality = format["qualityLabel"].toString();
         video.duration = format["approxDurationMs"].toInt();
         video.contentLength = format["contentLength"].toString().toULongLong();
+        video.hasEmbeddedAudio = true; // progressive == muxed video+audio
 
         if (format.contains("url")) {
             video.url = QUrl::fromPercentEncoding(format["url"].toByteArray());
@@ -142,19 +143,31 @@ void StorageParser::parseFromJsonInternal(StorageData *storageData,
                 haveAudio = isMp4Audio || haveAudio;
                 if (!haveAudio) haveAudio = true;
             }
-        } else if (isVideo && storageData->instances.isEmpty()) {
-            // Only used as a fallback if "formats" gave us nothing at all
-            // (some restricted/age-gated or new uploads only expose
-            // adaptiveFormats). These are video-only streams (no embedded
-            // audio track) but better than nothing for playback.
+        } else if (isVideo) {
+            // NOTE: this used to be gated behind "storageData->instances.isEmpty()",
+            // intended only as a fallback when the progressive "formats" array
+            // gave us nothing. In practice, "formats" almost always contains
+            // exactly one entry (itag 18, 360p) even when it's non-empty, so
+            // that guard silently discarded every 480p/720p/1080p video-only
+            // adaptive stream and left users stuck at 360p with the quality
+            // picker disabled (it only enables when there's more than one
+            // instance, or a usable audio track). We now always collect
+            // video-only mp4 (H.264) adaptive formats alongside progressive
+            // ones; PlayerPage is responsible for muxing video-only + audio
+            // together (or falling back to silent/audio-only playback) since
+            // BB10's mmrenderer cannot play two separate streams at once.
             if (!mimeType.contains("video/mp4")) {
-                continue;
+                continue; // skip webm/vp9 and av1 — not decodable on BB10 hardware
             }
 
             SingleVideoStorageData video;
             video.quality = format["qualityLabel"].toString();
             video.duration = format["approxDurationMs"].toInt();
             video.contentLength = format["contentLength"].toString().toULongLong();
+            // Adaptive video-only stream -- no audio track in this file.
+            // PlayerPage must pair it with storageData->audio and remux
+            // (StreamingRemuxSession) before it's playable with sound.
+            video.hasEmbeddedAudio = false;
 
             if (format.contains("url")) {
                 video.url = QUrl::fromPercentEncoding(format["url"].toByteArray());

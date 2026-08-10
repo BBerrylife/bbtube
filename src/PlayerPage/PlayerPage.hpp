@@ -11,6 +11,7 @@
 #include "src/models/PlaylistVideoModel.hpp"
 #include "src/models/PlaylistListItemModel.hpp"
 #include "src/utils/CustomListView.hpp"
+#include "src/utils/StreamingRemuxSession.hpp"
 
 #include <bb/cascades/Container>
 #include <bb/cascades/Slider>
@@ -87,6 +88,9 @@ private slots:
     void onPlaylistVideoAdded(PlaylistVideoModel* video);
     void onPlaylistVideoDeleted(QString videoId, PlaylistListItemModel::Type playlistType);
     void onPlaylistVideoDeletedAll(PlaylistListItemModel::Type playlistType);
+    void onRemuxHeadReady();
+    void onRemuxFailed(QString errorMessage);
+    void onRemuxFinished();
 private:
     void init(VideoMetadata videoMetadata, StorageData storageData,
             bb::cascades::NavigationPane *navigationPane, bool audioOnly);
@@ -134,6 +138,8 @@ private:
     QString quality;
     QString nextVideoId;
     QString prevVideoId;
+    StreamingRemuxSession *remuxSession;
+    QString pendingRemuxQualityLabel; // "" == initial playback, else = quality label pending a changeQuality() once the remux head is ready
     void resizeVideo();
     void playVideo();
     void setInfos();
@@ -142,6 +148,11 @@ private:
     void showInfos();
     void setAudioOnly(bool audioOnly);
     void changeQuality(QString newQuality, QString url);
+    void startPlaybackAt(QString url);
+    void playVideoWithRemux(SingleVideoStorageData videoData);
+    void changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData);
+    void startRemuxSession(SingleVideoStorageData videoData);
+    QString remuxOutputPathFor(QString videoId, QString quality);
     int getIndexOfDefaultQuality();
     QString getScalingMethodString(bb::cascades::ScalingMethod::Type type);
     void adjustInfoScreen();

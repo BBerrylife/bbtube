@@ -34,34 +34,78 @@ static const QString INNERTUBE_CLIENT_VERSION = "2.20240101.00.00";
 static const QString INNERTUBE_CLIENT_NAME    = "WEB";
 static const QString INNERTUBE_API_URL_BASE   = "https://www.youtube.com/youtubei/v1/";
 
-// ANDROID client context used ONLY for the /player endpoint (gets us
-// non-throttled, non-ciphered stream URLs without needing the signature
-// decipher pipeline). This MUST stay internally consistent: the ?key=,
-// the clientVersion in the JSON body, and the X-YouTube-Client-Name/
-// X-YouTube-Client-Version headers must all describe the SAME client.
-// Mixing an ANDROID body with WEB headers (client name "1") is what was
-// originally causing a 400 "Bad Request" on video playback — YouTube
-// validates the header client id against the body client name.
+// Multi-client fallback list for the /player endpoint, tried in order until
+// one gives us usable adaptiveFormats (i.e. isn't SABR-blocked). Sourced
+// from yt-dlp's youtube/_base.py INNERTUBE_CLIENTS on 2026-08-09.
 //
-// clientVersion sourced from yt-dlp's youtube/_base.py INNERTUBE_CLIENTS
-// (the ANDROID entry) on 2026-08-04 — that project tracks YouTube's
-// client-version enforcement closely and is the most reliable reference
-// for "what version still gets accepted right now". An outdated version
-// here doesn't cause an HTTP error; it comes back as HTTP 200 with
-// playabilityStatus.status == "ERROR" / "Watch on the latest version of
-// YouTube", which looks identical to a real unavailable-video response
-// unless you inspect the body (see the QT_DEBUG diagnostic block below).
-// UPDATE THIS VERSION periodically by checking that file.
-static const QString INNERTUBE_ANDROID_CLIENT_VERSION = "21.26.364";
-// X-YouTube-Client-Name id for the ANDROID client (WEB is "1", ANDROID is "3")
-static const QString INNERTUBE_ANDROID_CLIENT_NAME_ID = "3";
+// WHY THIS ORDER: as of 2026, YouTube enforces two independent gates on the
+// /player response:
+//   1) SABR-only streaming experiments, which strip "url"/"cipher" out of
+//      adaptiveFormats entirely for some clients/sessions (see
+//      https://github.com/yt-dlp/yt-dlp/issues/12482).
+//   2) A "GVS PO Token" requirement, which — separately — can make an
+//      included URL 403 without a valid token.
+// Per yt-dlp's current client table, "tv" (TVHTML5) and "android_vr" are the
+// only two clients with NO explicit GVS_PO_TOKEN_POLICY (i.e. not required
+// by default), so they're tried first. "android" is kept last as the
+// known-working-for-itag18 fallback this app already used.
+//
+// IMPORTANT for android_vr: yt-dlp pins clientVersion to exactly "1.65.10"
+// with an explicit upstream comment "Using a clientVersion>1.65 may return
+// SABR streams only" — do not bump this without re-checking that comment.
+//
+// None of this is a permanent fix. YouTube's SABR rollout is an active,
+// evolving anti-abuse system (yt-dlp itself is still finishing a proper SABR
+// downloader as of mid-2026); any of these clients can start returning
+// SABR-only responses too with no warning. Re-check yt-dlp's
+// yt_dlp/extractor/youtube/_base.py INNERTUBE_CLIENTS table periodically.
+struct InnertubeClientConfig {
+    const char *label;              // for debug logs only
+    const char *clientName;         // InnerTube "clientName"
+    const char *clientVersion;
+    const char *clientNameId;       // X-YouTube-Client-Name header / INNERTUBE_CONTEXT_CLIENT_NAME
+    const char *userAgent;
+    const char *extraContextFields; // raw JSON fragment(s), each ending in a comma, injected into the "client" object
+    const char *apiKey;
+};
 
-// REQUIRED: every InnerTube request must include a ?key= query parameter
-// matching the calling client, or the server replies "400 Bad Request"
-// before even looking at the JSON body. These are long-standing public
-// client keys embedded in YouTube's own web/Android clients (not secrets).
-static const QString INNERTUBE_API_KEY_WEB     = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-static const QString INNERTUBE_API_KEY_ANDROID = "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w";
+static const InnertubeClientConfig INNERTUBE_PLAYER_CLIENTS[] = {
+    {
+        "tv",
+        "TVHTML5",
+        "7.20260707.07.00",
+        "7",
+        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
+        "",
+        "AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8" // yt-dlp's shared default InnerTube key
+    },
+    {
+        "android_vr",
+        "ANDROID_VR",
+        "1.65.10",
+        "28",
+        "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+        "\"deviceMake\":\"Oculus\",\"deviceModel\":\"Quest 3\",\"androidSdkVersion\":32,\"osName\":\"Android\",\"osVersion\":\"12L\",",
+        "AIzaSyDCU8hByM-4DrUqRUYnGn-3llEO78bcxq8"
+    },
+    {
+        "android",
+        "ANDROID",
+        "21.26.364",
+        "3",
+        "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
+        "\"androidSdkVersion\":30,\"osName\":\"Android\",\"osVersion\":\"11\",",
+        "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w"
+    }
+};
+static const int INNERTUBE_PLAYER_CLIENTS_COUNT = 3;
+
+// REQUIRED for the WEB-client endpoints below (search/browse/etc): every
+// InnerTube request must include a ?key= query parameter matching the
+// calling client, or the server replies "400 Bad Request" before even
+// looking at the JSON body. This is a long-standing public client key
+// embedded in YouTube's own web client (not a secret).
+static const QString INNERTUBE_API_KEY_WEB = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 
 // YouTube Charts (charts.youtube.com) — replaces the classic Trending page
 // (browseId FEtrending), which YouTube shut down in July 2025. Charts runs
@@ -121,57 +165,50 @@ void YoutubeClient::process(QString text)
 void YoutubeClient::parse(QString videoId)
 {
     // Use InnerTube /player endpoint (POST) instead of fetching the watch page
-    // This is far more reliable than scraping HTML and parsing ytInitialData
-    QNetworkRequest request(INNERTUBE_API_URL_BASE + "player?key=" + INNERTUBE_API_KEY_ANDROID + "&prettyPrint=false");
+    // This is far more reliable than scraping HTML and parsing ytInitialData.
+    // Starts with the first client in INNERTUBE_PLAYER_CLIENTS; onPlayerApiFinished()
+    // automatically retries with the next client if this one looks SABR-blocked
+    // or fails outright.
+    requestPlayerData(videoId, 0);
+
+    // Also fetch the watch page to get ytInitialData for metadata & related videos
+    QNetworkRequest watchRequest = prepareRequest("https://www.youtube.com/watch?v=" + videoId + "&hl=en");
+    QNetworkReply *watchReply = ApplicationUI::networkManager->get(watchRequest);
+    watchReply->setProperty("videoId", videoId);
+    QObject::connect(watchReply, SIGNAL(finished()), this, SLOT(onGetHtmlFinished()));
+}
+
+// Issues the /player POST for a given client (see INNERTUBE_PLAYER_CLIENTS).
+// The reply is tagged with "videoId" and "clientIndex" so onPlayerApiFinished()
+// knows what it's looking at and which client to try next on failure.
+QNetworkReply* YoutubeClient::requestPlayerData(const QString &videoId, int clientIndex)
+{
+    const InnertubeClientConfig &cfg = INNERTUBE_PLAYER_CLIENTS[clientIndex];
+
+    QNetworkRequest request(INNERTUBE_API_URL_BASE + "player?key=" + QString(cfg.apiKey) + "&prettyPrint=false");
     request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
     // NOTE: do NOT call applyInnerTubeHeaders() here — that sets WEB client
-    // headers (X-YouTube-Client-Name: 1), which conflicts with the ANDROID
-    // client body below and causes a 400. Set matching ANDROID headers instead.
-    request.setRawHeader("User-Agent",
-        QString("com.google.android.youtube/%1 (Linux; U; Android 11) gzip")
-            .arg(INNERTUBE_ANDROID_CLIENT_VERSION).toUtf8());
-    request.setRawHeader("X-YouTube-Client-Name", INNERTUBE_ANDROID_CLIENT_NAME_ID.toUtf8());
-    request.setRawHeader("X-YouTube-Client-Version", INNERTUBE_ANDROID_CLIENT_VERSION.toUtf8());
+    // headers (X-YouTube-Client-Name: 1), which conflicts with the client
+    // body below and causes a 400. Headers below must match cfg exactly.
+    request.setRawHeader("User-Agent", QByteArray(cfg.userAgent));
+    request.setRawHeader("X-YouTube-Client-Name", QByteArray(cfg.clientNameId));
+    request.setRawHeader("X-YouTube-Client-Version", QByteArray(cfg.clientVersion));
 
-    // NOTE: androidSdkVersion IS required here. Attempting to omit it
-    // ("sdkless" trick, previously used by some yt-dlp forks to dodge the
-    // PO-Token-for-GVS requirement) now gets the /player call itself
-    // rejected outright with playabilityStatus ERROR / "Watch on the
-    // latest version of YouTube" — YouTube tightened validation on the
-    // ANDROID client context and now requires this field to accept the
-    // request at all. Any PO-Token requirement for the actual stream URL
-    // (GVS) is a separate, later concern from getting a valid /player
-    // response in the first place.
-    //
     // "params":"8AEB" (a fixed, unexplained magic value from the original
-    // implementation) has been REMOVED. Cross-checked against yt-dlp's
-    // current youtube extractor (_video.py, _extract_player_response):
-    // the android client entry has no fixed PLAYER_PARAMS at all, so
-    // yt-dlp sends no "params" field for it. Whatever "8AEB" decoded to
-    // (some old feature/context flag) is very likely what's now getting
-    // this client's /player calls universally rejected with ERROR
-    // "Watch on the latest version of YouTube" regardless of clientVersion
-    // — the version bump alone didn't fix it, which points at the request
-    // shape rather than the version string.
-    //
-    // Added "playbackContext"/"contentCheckOk"/"racyCheckOk", matching
-    // yt-dlp's _generate_player_context(): every real /player call yt-dlp
-    // makes includes these, and this app's request was missing them
-    // entirely.
+    // implementation) is intentionally NOT sent — cross-checked against
+    // yt-dlp's extractor, none of these clients send a fixed PLAYER_PARAMS.
     QString body = QString(
         "{"
         "\"context\":{"
             "\"client\":{"
-                "\"clientName\":\"ANDROID\","
+                "\"clientName\":\"%1\","
                 "\"clientVersion\":\"%2\","
-                "\"androidSdkVersion\":30,"
-                "\"osName\":\"Android\","
-                "\"osVersion\":\"11\","
+                "%3"
                 "\"hl\":\"en\","
                 "\"gl\":\"US\""
             "}"
         "},"
-        "\"videoId\":\"%1\","
+        "\"videoId\":\"%4\","
         "\"contentCheckOk\":true,"
         "\"racyCheckOk\":true,"
         "\"playbackContext\":{"
@@ -180,18 +217,13 @@ void YoutubeClient::parse(QString videoId)
             "}"
         "}"
         "}"
-    ).arg(videoId, INNERTUBE_ANDROID_CLIENT_VERSION);
+    ).arg(cfg.clientName, cfg.clientVersion, cfg.extraContextFields, videoId);
 
-    // Store videoId for use in onGetHtmlFinished
     QNetworkReply *playerReply = ApplicationUI::networkManager->post(request, body.toUtf8());
     playerReply->setProperty("videoId", videoId);
+    playerReply->setProperty("clientIndex", clientIndex);
     QObject::connect(playerReply, SIGNAL(finished()), this, SLOT(onPlayerApiFinished()));
-
-    // Also fetch the watch page to get ytInitialData for metadata & related videos
-    QNetworkRequest watchRequest = prepareRequest("https://www.youtube.com/watch?v=" + videoId + "&hl=en");
-    QNetworkReply *watchReply = ApplicationUI::networkManager->get(watchRequest);
-    watchReply->setProperty("videoId", videoId);
-    QObject::connect(watchReply, SIGNAL(finished()), this, SLOT(onGetHtmlFinished()));
+    return playerReply;
 }
 
 void YoutubeClient::search(QString text)
@@ -391,9 +423,22 @@ void YoutubeClient::onPlayerApiFinished()
 {
     QNetworkReply *reply = static_cast<QNetworkReply*>(QObject::sender());
     QString videoId = reply->property("videoId").toString();
+    int clientIndex = reply->property("clientIndex").toInt();
     QString httpErrorMessage;
 
     if (reply->error() || hasHttpError(reply, &httpErrorMessage)) {
+        // This client failed outright (network error, or e.g. a 400 from a
+        // stale clientVersion). Try the next client before giving up.
+        if (clientIndex + 1 < INNERTUBE_PLAYER_CLIENTS_COUNT) {
+#ifdef QT_DEBUG
+            qDebug() << "[bbtube][player] client" << INNERTUBE_PLAYER_CLIENTS[clientIndex].label
+                     << "request failed (" << (reply->error() ? reply->errorString() : httpErrorMessage)
+                     << ") - trying" << INNERTUBE_PLAYER_CLIENTS[clientIndex + 1].label;
+#endif
+            requestPlayerData(videoId, clientIndex + 1);
+            reply->deleteLater();
+            return;
+        }
         emit error(reply->error() ? reply->errorString() : httpErrorMessage);
         // Discard any metadata that arrived for this videoId — it would
         // otherwise sit in pendingVideoMetadata forever since
@@ -415,7 +460,8 @@ void YoutubeClient::onPlayerApiFinished()
     {
         int psIdx = response.indexOf("\"playabilityStatus\"");
         int sdIdx = response.indexOf("\"streamingData\"");
-        qDebug() << "=== /player diagnostic for videoId" << videoId << "===";
+        qDebug() << "=== /player diagnostic for videoId" << videoId
+                  << "client" << INNERTUBE_PLAYER_CLIENTS[clientIndex].label << "===";
         qDebug() << "playabilityStatus snippet:"
                   << (psIdx >= 0 ? response.mid(psIdx, 400) : "NOT FOUND");
         qDebug() << "streamingData snippet:"
@@ -449,8 +495,46 @@ void YoutubeClient::onPlayerApiFinished()
                      << ", qualityLabel =" << f["qualityLabel"].toString()
                      << ", mimeType =" << f["mimeType"].toString();
         }
+
+        // SABR check: dump every key present on the first AUDIO entry. If
+        // "url" / "signatureCipher" / "cipher" are all absent here, YouTube
+        // is not returning direct playback URLs at all for this client
+        // (forced SABR streaming) -- no amount of JSON parsing fixes that;
+        // it needs either a different client context or a PO Token/SABR
+        // downloader implementation. See:
+        // https://github.com/yt-dlp/yt-dlp/issues/12482
+        for (int i = 0; i < diagAdaptive.count(); i++) {
+            QVariantMap f = diagAdaptive[i].toMap();
+            if (f["mimeType"].toString().startsWith("audio/")) {
+                qDebug() << "[bbtube][player][SABR-check] keys on first audio format:"
+                         << f.keys();
+                qDebug() << "[bbtube][player][SABR-check] has url =" << f.contains("url")
+                         << ", has signatureCipher =" << f.contains("signatureCipher")
+                         << ", has cipher =" << f.contains("cipher");
+                break;
+            }
+        }
     }
 #endif
+
+    // Does this client's response give us anything beyond the single
+    // progressive itag18 stream (i.e. any usable adaptive video and/or
+    // audio URL/cipher)? If not, and there's another client left in
+    // INNERTUBE_PLAYER_CLIENTS, retry with it instead of settling for
+    // 360p-only — see the big comment above INNERTUBE_PLAYER_CLIENTS.
+    bool audioUsable = !storageData.audio.url.isEmpty() || !storageData.audio.cipher.isEmpty();
+    bool looksSabrBlocked = storageData.instances.count() <= 1 && !audioUsable;
+
+    if (looksSabrBlocked && clientIndex + 1 < INNERTUBE_PLAYER_CLIENTS_COUNT) {
+#ifdef QT_DEBUG
+        qDebug() << "[bbtube][player] client" << INNERTUBE_PLAYER_CLIENTS[clientIndex].label
+                 << "looks SABR-blocked (no usable adaptive URL/cipher) - trying"
+                 << INNERTUBE_PLAYER_CLIENTS[clientIndex + 1].label;
+#endif
+        requestPlayerData(videoId, clientIndex + 1);
+        reply->deleteLater();
+        return;
+    }
 
     // Decrypt any cipher-protected URLs.
     // NOTE: this check is intentionally NOT nested inside an

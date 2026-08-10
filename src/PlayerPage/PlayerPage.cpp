@@ -21,6 +21,9 @@
 #include "TimecodeSheet.hpp"
 #include "src/utils/VideoViewedPercentProxy.hpp"
 
+#include <QDir>
+#include <QRegExp>
+
 #include <bb/cascades/Page>
 #include <bb/cascades/Container>
 #include <bb/cascades/DockLayout>
@@ -104,6 +107,8 @@ void PlayerPage::init(VideoMetadata videoMetadata, StorageData storageData,
     this->sliderDoubleTap = false;
     this->trackpadFocusInSlider = false;
     appSettings = ApplicationUI::appSettings;
+    this->remuxSession = 0;
+    this->pendingRemuxQualityLabel = "";
 
     root->setLayout(new bb::cascades::DockLayout());
     foreignWindowControl = bb::cascades::ForeignWindowControl::create().updatedProperties(
@@ -656,10 +661,9 @@ void PlayerPage::playVideo()
         isLiveStream = duration == 0;
 
         QString url;
+        SingleVideoStorageData data;
 
         if (isLiveStream || !audioOnly || storageData.audio.url == "") {
-            SingleVideoStorageData data;
-
             if (alreadyPlaying) {
                 data = playerContext->getSelectedStorageData();
             } else {
@@ -724,29 +728,123 @@ void PlayerPage::playVideo()
             playerContext->resetClosedCaptionUrl();
             playerContext->setCcLanguage("");
 
-            bb::multimedia::MediaError::Type error = playerContext->play(url);
-            if (error == bb::multimedia::MediaError::None) {
-                addToHistory();
-
-                if (watched.count() == 0 || watched.last() != videoMetadata.video.videoId) {
-                    watched.append(videoMetadata.video.videoId);
-
-                    setPrevVideoId();
-                }
-
-                if (playerContext->isContinuePlaying() && progressSlider->isEnabled()) {
-                    playerContext->seekTime(
-                            (0.0f
-                                    + VideoViewedPercentProxy::getInstance()->getPercent(
-                                            videoMetadata.video.videoId)) * duration / 10000);
-                    playerContext->setContinuePlaying(false);
-                }
+            if (!isLiveStream && !data.hasEmbeddedAudio && storageData.audio.url != "") {
+                // Adaptive video-only stream (e.g. 720p/1080p): BB10's
+                // mmrenderer can't play this and a separate audio track at
+                // the same time, so remux them into one local file first.
+                // startPlaybackAt() runs once the remux head is ready
+                // (StreamingRemuxSession::headReady) instead of here.
+                playVideoWithRemux(data);
             } else {
-                qDebug() << error << url;
-                UIUtils::toastError("Source unavailable");
+                startPlaybackAt(url);
             }
         }
     }
+}
+
+void PlayerPage::startPlaybackAt(QString url)
+{
+    bb::multimedia::MediaError::Type error = playerContext->play(url);
+    if (error == bb::multimedia::MediaError::None) {
+        addToHistory();
+
+        if (watched.count() == 0 || watched.last() != videoMetadata.video.videoId) {
+            watched.append(videoMetadata.video.videoId);
+
+            setPrevVideoId();
+        }
+
+        if (playerContext->isContinuePlaying() && progressSlider->isEnabled()) {
+            playerContext->seekTime(
+                    (0.0f
+                            + VideoViewedPercentProxy::getInstance()->getPercent(
+                                    videoMetadata.video.videoId)) * duration / 10000);
+            playerContext->setContinuePlaying(false);
+        }
+    } else {
+        qDebug() << error << url;
+        UIUtils::toastError("Source unavailable");
+    }
+}
+
+void PlayerPage::playVideoWithRemux(SingleVideoStorageData videoData)
+{
+    pendingRemuxQualityLabel = ""; // "" == this is an initial playback, not a mid-playback quality switch
+    startRemuxSession(videoData);
+}
+
+void PlayerPage::changeQualityWithRemux(QString newQuality, SingleVideoStorageData videoData)
+{
+    pendingRemuxQualityLabel = newQuality;
+    startRemuxSession(videoData);
+}
+
+void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
+{
+    QString outputPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality);
+
+    if (remuxSession) {
+        remuxSession->deleteLater();
+        remuxSession = 0;
+    }
+
+    remuxSession = new StreamingRemuxSession(ApplicationUI::networkManager, videoData.url,
+            storageData.audio.url, outputPath, this);
+
+    QObject::connect(remuxSession, SIGNAL(headReady()), this, SLOT(onRemuxHeadReady()));
+    QObject::connect(remuxSession, SIGNAL(failed(QString)), this, SLOT(onRemuxFailed(QString)));
+    QObject::connect(remuxSession, SIGNAL(finished()), this, SLOT(onRemuxFinished()));
+
+    remuxSession->start();
+}
+
+void PlayerPage::onRemuxHeadReady()
+{
+    // Output file is now valid ISOBMFF at its final size (audio+video
+    // still filling in for the video body). Safe to hand to the player
+    // now -- audio is streamed in first and completes quickly since it's
+    // small, and mmrenderer reads sequentially from the front.
+    if (pendingRemuxQualityLabel != "") {
+        QString newQuality = pendingRemuxQualityLabel;
+        pendingRemuxQualityLabel = "";
+        changeQuality(newQuality, remuxSession->outputPath());
+    } else {
+        startPlaybackAt(remuxSession->outputPath());
+    }
+}
+
+void PlayerPage::onRemuxFailed(QString errorMessage)
+{
+    qDebug() << "[bbtube][remux] failed:" << errorMessage;
+    UIUtils::toastError("Source unavailable");
+    if (remuxSession) {
+        remuxSession->deleteLater();
+        remuxSession = 0;
+    }
+    pendingRemuxQualityLabel = "";
+}
+
+void PlayerPage::onRemuxFinished()
+{
+    // Both tracks fully written to the local output file. Playback is
+    // already underway (kicked off from onRemuxHeadReady()) -- this is
+    // just a diagnostic hook / place to hang future cache-management logic.
+#ifdef QT_DEBUG
+    if (remuxSession) {
+        qDebug() << "[bbtube][remux] finished writing" << remuxSession->outputPath();
+    }
+#endif
+}
+
+QString PlayerPage::remuxOutputPathFor(QString videoId, QString quality)
+{
+    QDir dir(QDir::homePath() + "/remux_cache");
+    if (!dir.exists()) {
+        dir.mkpath(".");
+    }
+    QString safeQuality = quality;
+    safeQuality.replace(QRegExp("[^A-Za-z0-9]"), "_");
+    return dir.absoluteFilePath(videoId + "_" + safeQuality + ".mp4");
 }
 
 void PlayerPage::setInfos()
@@ -1004,10 +1102,20 @@ void PlayerPage::onQualityDialogFinished(bb::system::SystemUiResult::Type type)
 
         if (selected < storageData.instances.count()) {
             SingleVideoStorageData storage = storageData.instances[selected];
-            url = storage.url;
             newQuality = storage.quality;
             setAudioOnly(false);
             playerContext->setSelectedStorageData(storage);
+
+            if (!storage.hasEmbeddedAudio && storageData.audio.url != "") {
+                // Adaptive video-only stream: needs the same remux step as
+                // initial playback before it's watchable with sound.
+                if (quality != newQuality) {
+                    changeQualityWithRemux(newQuality, storage);
+                }
+                videoQualityDialog->deleteLater();
+                return;
+            }
+            url = storage.url;
         } else {
             url = storageData.audio.url;
             newQuality = "Audio";
