@@ -1,9 +1,11 @@
 #include "SettingsSheet.hpp"
 #include "src/applicationui.hpp"
+#include "src/auth/GoogleLoginSheet.hpp"
 
 #include <bb/cascades/Page>
 #include <bb/cascades/Container>
 #include <bb/cascades/ToggleButton>
+#include <bb/cascades/Button>
 #include <bb/cascades/TextField>
 #include <bb/cascades/Label>
 #include <bb/cascades/TitleBar>
@@ -97,6 +99,32 @@ SettingsSheet::SettingsSheet() :
     playbackTimeoutCommentContainer->add(playbackTimeoutCommentLabel);
     container->add(playbackTimeoutCommentContainer);
 
+    container->add(Divider::create());
+
+    Container *googleAccountLabelContainer = Container::create().topMargin(ui->du(1));
+    Label *googleAccountTitleLabel = Label::create().text("Google Account");
+    googleAccountTitleLabel->textStyle()->setBase(SystemDefaults::TextStyles::titleText());
+    googleAccountLabelContainer->add(googleAccountTitleLabel);
+    container->add(googleAccountLabelContainer);
+
+    Container *googleAccountCommentContainer = Container::create();
+    googleAccountCommentContainer->setTopMargin(ui->du(1));
+    googleAccountCommentContainer->setHorizontalAlignment(HorizontalAlignment::Fill);
+    googleAccountStatusLabel = Label::create().multiline(true);
+    googleAccountStatusLabel->textStyle()->setBase(SystemDefaults::TextStyles::subtitleText());
+    googleAccountCommentContainer->add(googleAccountStatusLabel);
+    container->add(googleAccountCommentContainer);
+
+    googleAccountButton = Button::create().topMargin(ui->du(1));
+    QObject::connect(googleAccountButton, SIGNAL(clicked()), this,
+            SLOT(googleAccountButtonClick()));
+    container->add(googleAccountButton);
+
+    QObject::connect(ApplicationUI::googleAuthManager, SIGNAL(loginStateChanged(bool, QString)),
+            this, SLOT(onGoogleLoginStateChanged(bool, QString)));
+
+    refreshGoogleAccountUi();
+
     TitleBar *titleBar = new TitleBar(TitleBarKind::Default);
     ActionItem *closeAction = ActionItem::create().title("Cancel");
     ActionItem *saveAction = ActionItem::create().title("Done");
@@ -133,4 +161,43 @@ void SettingsSheet::saveActionClick()
     appSettings->setDefaultQuality(qualityDropdown->selectedValue().toString());
 
     closeSheet();
+}
+
+void SettingsSheet::refreshGoogleAccountUi()
+{
+    GoogleAuthManager *auth = ApplicationUI::googleAuthManager;
+    if (auth->isLoggedIn()) {
+        QString email = auth->email();
+        if (email.isEmpty()) {
+            googleAccountStatusLabel->setText("Signed in to Google.");
+        } else {
+            googleAccountStatusLabel->setText("Signed in as " + email + ".");
+        }
+        googleAccountButton->setText("Log out");
+    } else {
+        googleAccountStatusLabel->setText(
+                "Sign in with a real Google account to help avoid YouTube's "
+                        "\"Sign in to confirm you're not a bot\" restriction, which can "
+                        "block higher-quality video streams.");
+        googleAccountButton->setText("Login to Google");
+    }
+}
+
+void SettingsSheet::googleAccountButtonClick()
+{
+    if (ApplicationUI::googleAuthManager->isLoggedIn()) {
+        ApplicationUI::googleAuthManager->logout();
+        // logout() emits loginStateChanged, which onGoogleLoginStateChanged
+        // handles by calling refreshGoogleAccountUi() -- no need to do it
+        // again here.
+    } else {
+        new GoogleLoginSheet(); // self-parenting BaseSheet, closes/deletes itself
+    }
+}
+
+void SettingsSheet::onGoogleLoginStateChanged(bool loggedIn, QString email)
+{
+    Q_UNUSED(loggedIn);
+    Q_UNUSED(email);
+    refreshGoogleAccountUi();
 }

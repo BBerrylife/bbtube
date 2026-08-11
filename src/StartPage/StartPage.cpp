@@ -45,7 +45,7 @@
 #include <QVariantList>
 
 StartPage::StartPage(bb::cascades::NavigationPane *navigationPane) :
-        BasePage(navigationPane)
+        BasePage(navigationPane), videoPlaybackPending(false)
 {
     bb::cascades::Container *container = new bb::cascades::Container();
     container->setVerticalAlignment(bb::cascades::VerticalAlignment::Fill);
@@ -160,11 +160,19 @@ void StartPage::onInputFieldSubmit()
         return;
     }
 
-    overlay->setVisible(true);
     suggestionsList->setVisible(false);
     filterContainer->setVisible(false);
     showFiltersActionItem->setTitle("Show Filters");
-    youtubeClient->process(text);
+
+    // Only treat this as "pending video playback" (which would suppress
+    // onSearchDataReceived, see there) when the text is actually a video
+    // URL/ID -- a plain search query falls through to
+    // youtubeClient->process() -> search(), and that call's own
+    // onSearchDataReceived response must NOT be suppressed by this flag.
+    if (!YoutubeClient::getVideoId(text).isEmpty()) {
+        videoPlaybackPending = true;
+    }
+    playVideoByIdOrUrl(text);
 }
 
 void StartPage::onInputFieldChanging(QString text)
@@ -216,12 +224,25 @@ void StartPage::onSuggestionsReceived(QStringList list)
 
 void StartPage::onMetadataReceived(VideoMetadata videoMetadata, StorageData storageData)
 {
+    videoPlaybackPending = false;
     BasePage::onMetadataReceived(videoMetadata, storageData);
     searchResultsList->setEnabled(true);
 }
 
 void StartPage::onSearchDataReceived(SearchData searchData)
 {
+    if (videoPlaybackPending) {
+        // A search response arrived after the user already tapped a
+        // video and moved into "loading that video" state (e.g. a slow
+        // network response for an earlier search query). Applying it now
+        // would incorrectly hide the video-loading overlay and silently
+        // repopulate the results list out from under the user. Drop it;
+        // the search results the user is currently interacting with
+        // (searchResultsList) stay as they are, and the pending video
+        // load continues normally via onMetadataReceived()/onYoutubeError().
+        return;
+    }
+
     overlay->setVisible(false);
     bb::cascades::GroupDataModel *groupModel = new bb::cascades::GroupDataModel(
             QStringList() << "category" << "sortOrder");
@@ -331,8 +352,8 @@ void StartPage::onSearchResultsListItemClick(QVariantList indexPath)
                 searchResultsList->dataModel()->data(indexPath).value<QObject*>());
 
         if (item->type == VideoListItemModel::Video) {
-            overlay->setVisible(true);
-            youtubeClient->process("https://www.youtube.com/watch?v=" + item->id);
+            videoPlaybackPending = true;
+            playVideoByIdOrUrl(item->id);
         } else if (item->type == VideoListItemModel::Channel) {
             overlay->setVisible(true);
             youtubeClient->channel(item->id);
@@ -366,6 +387,7 @@ void StartPage::onPlayAudioOnlyActionItemClick(QVariantList indexPath)
 
 void StartPage::onYoutubeError(QString message)
 {
+    videoPlaybackPending = false;
     searchResultsList->setEnabled(true);
     BasePage::onYoutubeError(message);
 }
@@ -374,6 +396,7 @@ void StartPage::playVideoFromOutside(QString url)
 {
     inputField->loseFocus();
     this->setAudioOnly(false);
+    videoPlaybackPending = true;
     BasePage::playVideoFromOutside(url);
 }
 void StartPage::searchFromOutside(QString text)

@@ -371,23 +371,20 @@ void PlaylistPage::onSearchActionItemClick()
 
 void PlaylistPage::playVideo(QString videoId)
 {
-    overlay->setVisible(true);
     isPlaylist = true;
     setPlaylist();
-    youtubeClient->process("https://www.youtube.com/watch?v=" + videoId);
+    playVideoByIdOrUrl(videoId);
 }
 
 void PlaylistPage::playAll(bool shuffle)
 {
-    overlay->setVisible(true);
     isPlaylist = true;
     setPlaylist();
     if (shuffle) {
         playerContext->shufflePlaylist();
     }
 
-    youtubeClient->process(
-            "https://www.youtube.com/watch?v=" + playerContext->getVideoFromPlaylistByIndex(0));
+    playVideoByIdOrUrl(playerContext->getVideoFromPlaylistByIndex(0));
 }
 
 void PlaylistPage::playAudioOnly(QString videoId)

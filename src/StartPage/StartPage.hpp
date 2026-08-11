@@ -53,6 +53,18 @@ private:
     bool isBuildingDropdowns;
     bb::cascades::ActionItem *showFiltersActionItem;
 
+    // Guards against a stale searchDataReceived() response landing after
+    // the user has already tapped a video and moved into "loading that
+    // video" state. Without this, a slow/delayed search response can
+    // arrive while playVideoByIdOrUrl() is waiting on
+    // Invidious/YoutubeClient, hide the loading overlay early (see
+    // onSearchDataReceived()), and silently repopulate searchResultsList
+    // -- from the user's perspective the tap on the video appears to do
+    // nothing and the list changes underneath them. Set true right
+    // before initiating video playback, cleared once
+    // onMetadataReceived()/onYoutubeError() resolves that attempt.
+    bool videoPlaybackPending;
+
     void buildSearchFilterDropDown(bb::cascades::DropDown *dropdown, SearchParamGroup *group);
 public:
     StartPage(bb::cascades::NavigationPane *navigationPane);

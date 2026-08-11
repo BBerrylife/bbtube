@@ -330,6 +330,59 @@ void DbHelper::setPlaybackTimeout(int value)
     }
 }
 
+QString DbHelper::getGoogleAuthValue(QString key)
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("SELECT [Value] FROM GoogleAuth WHERE [Key] = :key;");
+    query.bindValue(":key", key);
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+
+    QSqlRecord rec = query.record();
+    if (!query.next()) {
+        return "";
+    }
+
+    return query.value(rec.indexOf("Value")).toString();
+}
+
+void DbHelper::setGoogleAuthValue(QString key, QString value)
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare(
+            "INSERT OR REPLACE INTO GoogleAuth([Key], [Value]) VALUES(:key, :value);");
+    query.bindValue(":key", key);
+    query.bindValue(":value", value);
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+}
+
+void DbHelper::clearGoogleAuth()
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("DELETE FROM GoogleAuth;");
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+}
+
 void DbHelper::createChannel(const ChannelListItemModel *channel)
 {
     QSqlQuery query(getDbContext());

@@ -3,9 +3,12 @@
 
 #include "AppSettings.hpp"
 #include "src/utils/BaseSheet.hpp"
+#include "src/auth/GoogleAuthManager.hpp"
 
 #include <QObject>
 #include <bb/cascades/ToggleButton>
+#include <bb/cascades/Button>
+#include <bb/cascades/Label>
 #include <bb/cascades/TextField>
 #include <bb/cascades/Dropdown>
 
@@ -21,12 +24,18 @@ public:
     }
 private slots:
     void saveActionClick();
+    void googleAccountButtonClick();
+    void onGoogleLoginStateChanged(bool loggedIn, QString email);
 private:
+    void refreshGoogleAccountUi();
+
     AppSettings *appSettings;
     ToggleButton *autoplayButton;
     TextField *playbackTimeoutTextField;
     DropDown *tabDropdown;
     DropDown *qualityDropdown;
+    Label *googleAccountStatusLabel;
+    Button *googleAccountButton;
 };
 
 #endif /* SETTINGSSHEET_HPP_ */

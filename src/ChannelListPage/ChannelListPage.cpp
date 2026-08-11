@@ -209,8 +209,7 @@ ChannelListPage::ChannelListPage(bb::cascades::NavigationPane *navigationPane) :
 
 void ChannelListPage::playVideoFromOutside(QString url)
 {
-    overlay->setVisible(true);
-    youtubeClient->process(url);
+    playVideoByIdOrUrl(url);
 }
 
 void ChannelListPage::onChannelListItemClick(QVariantList indexPath)
@@ -529,8 +528,7 @@ void ChannelListPage::onFeedListItemClick(QVariantList indexPath)
 {
     VideoListItemModel *item = feedList->dataModel()->data(indexPath).value<VideoListItemModel*>();
     feedList->setEnabled(false);
-    overlay->setVisible(true);
-    youtubeClient->process("https://www.youtube.com/watch?v=" + item->id);
+    playVideoByIdOrUrl(item->id);
 }
 
 void ChannelListPage::onMetadataReceived(VideoMetadata videoMetadata, StorageData storageData)
@@ -572,8 +570,7 @@ void ChannelListPage::onSearchActionItemClick()
 
 void ChannelListPage::playVideo(QString videoId)
 {
-    overlay->setVisible(true);
-    youtubeClient->process("https://www.youtube.com/watch?v=" + videoId);
+    playVideoByIdOrUrl(videoId);
 }
 
 void ChannelListPage::playAudioOnly(QString videoId)

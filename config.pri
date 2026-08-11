@@ -93,6 +93,7 @@ config_pri_assets {
         $$quote($$BASEDIR/assets/sql/Script000004.sql) \
         $$quote($$BASEDIR/assets/sql/Script000005.sql) \
         $$quote($$BASEDIR/assets/sql/Script000006.sql) \
+        $$quote($$BASEDIR/assets/sql/Script000007.sql) \
         $$quote($$BASEDIR/assets/youtube.db)
 }
 
@@ -122,8 +123,13 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/TrendingTab/TrendingTab.cpp) \
         $$quote($$BASEDIR/src/VideoList/SearchListItem.cpp) \
         $$quote($$BASEDIR/src/applicationui.cpp) \
+        $$quote($$BASEDIR/src/auth/CookieCrypto.cpp) \
+        $$quote($$BASEDIR/src/auth/GoogleAuthManager.cpp) \
+        $$quote($$BASEDIR/src/auth/GoogleLoginSheet.cpp) \
         $$quote($$BASEDIR/src/db/DbHelper.cpp) \
         $$quote($$BASEDIR/src/info/InfoSheet.cpp) \
+        $$quote($$BASEDIR/src/invidious/InvidiousClient.cpp) \
+        $$quote($$BASEDIR/src/invidious/InvidiousInstanceManager.cpp) \
         $$quote($$BASEDIR/src/main.cpp) \
         $$quote($$BASEDIR/src/menu/AppMenu.cpp) \
         $$quote($$BASEDIR/src/parser/YoutubeClient.cpp) \
@@ -142,6 +148,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/MiniPlayer.cpp) \
         $$quote($$BASEDIR/src/utils/PlaylistSheet.cpp) \
         $$quote($$BASEDIR/src/utils/PlaylistVideoProxy.cpp) \
+        $$quote($$BASEDIR/src/utils/SslTrust.cpp) \
         $$quote($$BASEDIR/src/utils/StreamingRemuxSession.cpp) \
         $$quote($$BASEDIR/src/utils/UIUtils.cpp) \
         $$quote($$BASEDIR/src/utils/VideoViewedPercentProxy.cpp) \
@@ -180,8 +187,13 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/TrendingTab/TrendingTab.hpp) \
         $$quote($$BASEDIR/src/VideoList/SearchListItemProvider.hpp) \
         $$quote($$BASEDIR/src/applicationui.hpp) \
+        $$quote($$BASEDIR/src/auth/CookieCrypto.hpp) \
+        $$quote($$BASEDIR/src/auth/GoogleAuthManager.hpp) \
+        $$quote($$BASEDIR/src/auth/GoogleLoginSheet.hpp) \
         $$quote($$BASEDIR/src/db/DbHelper.hpp) \
         $$quote($$BASEDIR/src/info/InfoSheet.hpp) \
+        $$quote($$BASEDIR/src/invidious/InvidiousClient.hpp) \
+        $$quote($$BASEDIR/src/invidious/InvidiousInstanceManager.hpp) \
         $$quote($$BASEDIR/src/menu/AppMenu.hpp) \
         $$quote($$BASEDIR/src/models/ChannelListItemModel.hpp) \
         $$quote($$BASEDIR/src/models/PlaylistListItemModel.hpp) \
@@ -219,6 +231,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/PlaybackTimeoutHandler.hpp) \
         $$quote($$BASEDIR/src/utils/PlaylistSheet.hpp) \
         $$quote($$BASEDIR/src/utils/PlaylistVideoProxy.hpp) \
+        $$quote($$BASEDIR/src/utils/SslTrust.hpp) \
         $$quote($$BASEDIR/src/utils/StreamingRemuxSession.hpp) \
         $$quote($$BASEDIR/src/utils/UIUtils.hpp) \
         $$quote($$BASEDIR/src/utils/UpdatableDataModel.hpp) \
@@ -312,6 +325,11 @@ lupdate_inclusion {
         $$quote($$BASEDIR/../src/VideoList/*.cc) \
         $$quote($$BASEDIR/../src/VideoList/*.cpp) \
         $$quote($$BASEDIR/../src/VideoList/*.cxx) \
+        $$quote($$BASEDIR/../src/auth/*.c) \
+        $$quote($$BASEDIR/../src/auth/*.c++) \
+        $$quote($$BASEDIR/../src/auth/*.cc) \
+        $$quote($$BASEDIR/../src/auth/*.cpp) \
+        $$quote($$BASEDIR/../src/auth/*.cxx) \
         $$quote($$BASEDIR/../src/db/*.c) \
         $$quote($$BASEDIR/../src/db/*.c++) \
         $$quote($$BASEDIR/../src/db/*.cc) \
@@ -322,6 +340,11 @@ lupdate_inclusion {
         $$quote($$BASEDIR/../src/info/*.cc) \
         $$quote($$BASEDIR/../src/info/*.cpp) \
         $$quote($$BASEDIR/../src/info/*.cxx) \
+        $$quote($$BASEDIR/../src/invidious/*.c) \
+        $$quote($$BASEDIR/../src/invidious/*.c++) \
+        $$quote($$BASEDIR/../src/invidious/*.cc) \
+        $$quote($$BASEDIR/../src/invidious/*.cpp) \
+        $$quote($$BASEDIR/../src/invidious/*.cxx) \
         $$quote($$BASEDIR/../src/menu/*.c) \
         $$quote($$BASEDIR/../src/menu/*.c++) \
         $$quote($$BASEDIR/../src/menu/*.cc) \

@@ -126,7 +126,6 @@ void PlaylistsPage::onPlaylistVideoDeletedAll(PlaylistListItemModel::Type playli
 
 void PlaylistsPage::playVideo(QString videoId)
 {
-    overlay->setVisible(true);
     isPlaylist = true;
-    youtubeClient->process("https://www.youtube.com/watch?v=" + videoId);
+    playVideoByIdOrUrl(videoId);
 }

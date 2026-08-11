@@ -57,6 +57,15 @@ public:
     static void setViewedPercent(QString videoId, int value);
     static void deleteViewedPercent(QString videoId);
     static void deleteAllViewedPercents();
+
+    // Google session (see src/auth/GoogleAuthManager). All values stored
+    // here are already encrypted/opaque by the time they reach the DB --
+    // see CookieCrypto -- except googleEmail, which is stored in the clear
+    // since it's only used for display ("Logged in as ...") and isn't
+    // sensitive on its own.
+    static QString getGoogleAuthValue(QString key);
+    static void setGoogleAuthValue(QString key, QString value);
+    static void clearGoogleAuth();
 };
 
 #endif /* DbHelper_HPP_ */

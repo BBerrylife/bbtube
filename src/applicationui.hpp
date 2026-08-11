@@ -3,6 +3,8 @@
 
 #include "src/utils/GlobalPlayerContext.hpp"
 #include "src/settings/AppSettings.hpp"
+#include "src/auth/GoogleAuthManager.hpp"
+#include "src/invidious/InvidiousInstanceManager.hpp"
 #include "src/BrowseTab/BrowseTab.hpp"
 #include "src/ChannelsTab/ChannelsTab.hpp"
 #include "src/PlaylistsTab/PlaylistsTab.hpp"
@@ -40,6 +42,8 @@ public:
     static QNetworkAccessManager *networkManager;
     static GlobalPlayerContext *playerContext;
     static AppSettings *appSettings;
+    static GoogleAuthManager *googleAuthManager;
+    static InvidiousInstanceManager *invidiousInstanceManager;
     static BaseSheet *activeSheet;private slots:
     void onSystemLanguageChanged();
     void onInvoke(const bb::system::InvokeRequest& request);

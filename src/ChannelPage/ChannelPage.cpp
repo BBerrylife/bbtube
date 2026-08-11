@@ -147,8 +147,7 @@ void ChannelPage::onVideoListItemClick(QVariantList indexPath)
 
     if (item->type == VideoListItemModel::Video) {
         videoList->setEnabled(false);
-        overlay->setVisible(true);
-        youtubeClient->process("https://www.youtube.com/watch?v=" + item->id);
+        playVideoByIdOrUrl(item->id);
     }
 }
 

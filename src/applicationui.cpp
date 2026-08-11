@@ -13,6 +13,7 @@
 #include "src/utils/ChannelListProxy.hpp"
 #include "src/utils/PlaylistVideoProxy.hpp"
 #include "src/utils/VideoViewedPercentProxy.hpp"
+#include "src/utils/SslTrust.hpp"
 
 #include <bb/cascades/Application>
 #include <bb/cascades/Page>
@@ -33,17 +34,23 @@ using namespace bb::cascades;
 QNetworkAccessManager* ApplicationUI::networkManager = 0;
 GlobalPlayerContext* ApplicationUI::playerContext = 0;
 AppSettings* ApplicationUI::appSettings = 0;
+GoogleAuthManager* ApplicationUI::googleAuthManager = 0;
+InvidiousInstanceManager* ApplicationUI::invidiousInstanceManager = 0;
 BaseSheet* ApplicationUI::activeSheet = 0;
 
 ApplicationUI::ApplicationUI() :
         QObject()
 {
     QTextCodec::setCodecForCStrings(QTextCodec::codecForName("UTF-8"));
+    SslTrust::installExtraRootCertificates();
     DbHelper::runMigrations();
 
     networkManager = new QNetworkAccessManager(this);
     playerContext = new GlobalPlayerContext(this);
     appSettings = new AppSettings(this);
+    googleAuthManager = new GoogleAuthManager(this);
+    invidiousInstanceManager = new InvidiousInstanceManager(this);
+    invidiousInstanceManager->refreshInstanceList();
     m_pTranslator = new QTranslator(this);
     m_pLocaleHandler = new LocaleHandler(this);
 

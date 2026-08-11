@@ -612,7 +612,7 @@ void PlayerPage::onNextActionItemClick()
     }
     hideInfos();
     overlay->setVisible(true);
-    youtubeClient->process("https://www.youtube.com/watch?v=" + nextVideoId);
+    playVideoByIdOrUrl(nextVideoId);
 }
 
 void PlayerPage::onPreviousActionItemClick()
@@ -630,7 +630,7 @@ void PlayerPage::onPreviousActionItemClick()
 
     hideInfos();
     overlay->setVisible(true);
-    youtubeClient->process("https://www.youtube.com/watch?v=" + prevVideoId);
+    playVideoByIdOrUrl(prevVideoId);
 }
 
 void PlayerPage::onMetadataReceived(VideoMetadata videoMetadata, StorageData storageData)
@@ -1051,7 +1051,7 @@ void PlayerPage::onUpnextVideoListItemClick(QVariantList indexPath)
     hideInfos();
     overlay->setVisible(true);
     upNextListView->setEnabled(false);
-    youtubeClient->process("https://www.youtube.com/watch?v=" + item->id);
+    playVideoByIdOrUrl(item->id);
     playerContext->stopPlaylist();
 }
 
@@ -1497,14 +1497,14 @@ void PlayerPage::playVideoFromOutside(QString url)
     hideInfos();
     overlay->setVisible(true);
     playerContext->stopPlaylist();
-    youtubeClient->process(url);
+    playVideoByIdOrUrl(url);
 }
 
 void PlayerPage::playVideoFromPlaylist(QString url)
 {
     hideInfos();
     overlay->setVisible(true);
-    youtubeClient->process(url);
+    playVideoByIdOrUrl(url);
 }
 
 void PlayerPage::onPlayAudioOnlyActionItemClick(QVariantList indexPath)
