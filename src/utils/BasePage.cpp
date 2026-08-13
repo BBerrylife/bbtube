@@ -89,18 +89,22 @@ void BasePage::onMetadataReceived(VideoMetadata videoMetadata, StorageData stora
 }
 void BasePage::playVideoByIdOrUrl(QString text)
 {
+    qDebug() << "[bbtube][baseplay] playVideoByIdOrUrl called with:" << text;
     overlay->setVisible(true);
 
     QString videoId = YoutubeClient::getVideoId(text);
+    qDebug() << "[bbtube][baseplay] resolved videoId:" << videoId;
     if (videoId.isEmpty()) {
         // Not a video URL/ID (e.g. a search query) -- Invidious routing
         // in this class is only for direct video playback, so go
         // straight to the normal YoutubeClient path.
+        qDebug() << "[bbtube][baseplay] not a video id/url, falling through to youtubeClient->process()";
         youtubeClient->process(text);
         return;
     }
 
     pendingVideoText = text;
+    qDebug() << "[bbtube][baseplay] calling invidiousClient->fetchVideo() for videoId:" << videoId;
     invidiousClient->fetchVideo(videoId);
 }
 void BasePage::playVideoFromOutside(QString url)

@@ -1,6 +1,7 @@
 #include "src/utils/StreamingRemuxSession.hpp"
 
 #include <QNetworkRequest>
+#include <QUrl>
 #include <QVariant>
 
 #ifdef QT_DEBUG
@@ -54,7 +55,9 @@ void StreamingRemuxSession::start()
 
 void StreamingRemuxSession::requestVideoHead()
 {
-    QNetworkRequest req(m_videoUrl);
+    // See the comment on beginBodyDownloads() below for why fromEncoded()
+    // is used here instead of QNetworkRequest(m_videoUrl) directly.
+    QNetworkRequest req(QUrl::fromEncoded(m_videoUrl.toUtf8()));
     req.setRawHeader("Range", "bytes=0-" + QByteArray::number(m_videoHeadFetchSize - 1));
     m_videoHeadReply = m_networkManager->get(req);
     QObject::connect(m_videoHeadReply, SIGNAL(finished()), this, SLOT(onVideoHeadFinished()));
@@ -62,7 +65,7 @@ void StreamingRemuxSession::requestVideoHead()
 
 void StreamingRemuxSession::requestAudioHead()
 {
-    QNetworkRequest req(m_audioUrl);
+    QNetworkRequest req(QUrl::fromEncoded(m_audioUrl.toUtf8()));
     req.setRawHeader("Range", "bytes=0-" + QByteArray::number(m_audioHeadFetchSize - 1));
     m_audioHeadReply = m_networkManager->get(req);
     QObject::connect(m_audioHeadReply, SIGNAL(finished()), this, SLOT(onAudioHeadFinished()));
@@ -182,13 +185,25 @@ void StreamingRemuxSession::beginBodyDownloads()
         return;
     }
 
-    QNetworkRequest audioReq(m_audioUrl);
+    // m_videoUrl/m_audioUrl come straight from YouTube's videoplayback
+    // URLs (via Invidious or InnerTube directly) and are ALREADY
+    // percent-encoded (e.g. "aitags=133%2C134..."). QNetworkRequest's
+    // QString constructor implicitly converts through QUrl(QString),
+    // which treats the input as a *human-readable* URL and re-encodes
+    // it -- turning an existing "%2C" into "%252C" (the literal '%'
+    // getting encoded a second time) and corrupting the query string.
+    // QUrl::fromEncoded() instead takes the bytes as already-valid
+    // percent-encoded form and leaves them alone. This bug was silent
+    // until the Invidious remux path was in regular use, since
+    // (informally observed) not every server/instance seemed to choke
+    // on the double-encoded query the same way.
+    QNetworkRequest audioReq(QUrl::fromEncoded(m_audioUrl.toUtf8()));
     audioReq.setRawHeader("Range",
             "bytes=" + QByteArray::number(qint64(m_audioHead.mdatBodyOffsetInSource)) + "-");
     m_audioBodyReply = m_networkManager->get(audioReq);
     QObject::connect(m_audioBodyReply, SIGNAL(finished()), this, SLOT(onAudioBodyFinished()));
 
-    QNetworkRequest videoReq(m_videoUrl);
+    QNetworkRequest videoReq(QUrl::fromEncoded(m_videoUrl.toUtf8()));
     videoReq.setRawHeader("Range",
             "bytes=" + QByteArray::number(qint64(m_videoHead.mdatBodyOffsetInSource)) + "-");
     m_videoBodyReply = m_networkManager->get(videoReq);

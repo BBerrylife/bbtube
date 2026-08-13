@@ -12,7 +12,7 @@
 #include <QTimer>
 
 InvidiousClient::InvidiousClient(InvidiousInstanceManager *instanceManager, QObject *parent) :
-        QObject(parent), instanceManager(instanceManager)
+        QObject(parent), instanceManager(instanceManager), pendingReply(0)
 {
 }
 
@@ -37,6 +37,7 @@ void InvidiousClient::requestFromInstance(const QString &videoId, const QString 
     request.setRawHeader("User-Agent", "bbtube (BlackBerry 10)");
 
     QNetworkReply *reply = ApplicationUI::networkManager->get(request);
+    pendingReply = reply;
     reply->setProperty("videoId", videoId);
     reply->setProperty("attemptNumber", attemptNumber);
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onVideoRequestFinished()));
@@ -48,7 +49,25 @@ void InvidiousClient::requestFromInstance(const QString &videoId, const QString 
     // stalled handshake against one bad instance would hang the video
     // load indefinitely (the "spins forever, never gets to the player"
     // symptom) instead of failing fast and retrying the next instance.
-    QTimer::singleShot(10000, reply, SLOT(abort()));
+    //
+    // NOT connected via QTimer::singleShot(ms, reply, SLOT(abort())) --
+    // that logs "Object::connect: No such slot QNetworkReplyImpl::abort()"
+    // on this BB10/Qt4 build and never actually fires, because
+    // QNetworkReply::abort() is pure virtual and the concrete
+    // QNetworkReplyImpl doesn't re-expose it through moc the way a normal
+    // Q_SLOT needs. Routing through our own onFetchTimeout() slot and
+    // calling reply->abort() as a plain (non-signal-slot) virtual call
+    // sidesteps that entirely. This was confirmed to be the actual cause
+    // of requests hanging past their intended 10s timeout in practice.
+    QTimer::singleShot(10000, this, SLOT(onFetchTimeout()));
+}
+
+void InvidiousClient::onFetchTimeout()
+{
+    if (pendingReply && !pendingReply->isFinished()) {
+        qDebug() << "[bbtube][invidious] video request timed out after 10s, aborting";
+        pendingReply->abort(); // triggers finished() -> onVideoRequestFinished() with an error set
+    }
 }
 
 void InvidiousClient::onSslErrors(const QList<QSslError> &errors)
@@ -71,6 +90,9 @@ void InvidiousClient::onVideoRequestFinished()
     QNetworkReply *reply = qobject_cast<QNetworkReply*>(sender());
     if (!reply) {
         return;
+    }
+    if (reply == pendingReply) {
+        pendingReply = 0;
     }
     reply->deleteLater();
 
@@ -154,13 +176,15 @@ void InvidiousClient::onVideoRequestFinished()
     mapToVideoMetadata(videoMap, &metadata);
 
     StorageData storageData;
-    mapToStorageData(videoMap, &storageData);
+    mapToStorageData(videoMap, reply->url(), &storageData);
 
     emit metadataReceived(metadata, storageData);
 }
 
 bool InvidiousClient::hasUsableStreams(const QVariantMap &videoMap)
 {
+    // Progressive streams are self-contained (audio+video already
+    // combined) -- any non-empty URL here is directly playable.
     QVariantList formatStreams = videoMap["formatStreams"].toList();
     for (int i = 0; i < formatStreams.count(); i++) {
         if (!formatStreams[i].toMap()["url"].toString().isEmpty()) {
@@ -168,9 +192,32 @@ bool InvidiousClient::hasUsableStreams(const QVariantMap &videoMap)
         }
     }
 
+    // Adaptive (video-only) streams need a paired audio track to be
+    // playable at all (see mapToStorageData, which now only adds
+    // video-only instances when a usable audio track is also present).
+    // Checking for ANY non-empty adaptiveFormats URL here (as this used
+    // to do) is not enough: an instance can return video-only entries
+    // with real URLs but zero usable audio tracks, which
+    // mapToStorageData correctly refuses to turn into a playable
+    // instance -- but this function would have called that instance
+    // "usable" anyway, so InvidiousClient never retried a different
+    // instance and the video silently failed to play (or played
+    // without sound / MediaError) instead.
     QVariantList adaptiveFormats = videoMap["adaptiveFormats"].toList();
+    bool hasVideo = false;
+    bool hasAudio = false;
     for (int i = 0; i < adaptiveFormats.count(); i++) {
-        if (!adaptiveFormats[i].toMap()["url"].toString().isEmpty()) {
+        QVariantMap fmt = adaptiveFormats[i].toMap();
+        if (fmt["url"].toString().isEmpty()) {
+            continue;
+        }
+        QString type = fmt["type"].toString();
+        if (type.startsWith("audio/")) {
+            hasAudio = true;
+        } else if (type.startsWith("video/")) {
+            hasVideo = true;
+        }
+        if (hasVideo && hasAudio) {
             return true;
         }
     }
@@ -262,7 +309,33 @@ static bool singleVideoStorageDataLessThan(const SingleVideoStorageData &a,
     return qualityLabelToNumber(a.quality) < qualityLabelToNumber(b.quality);
 }
 
-void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, StorageData *outStorageData)
+QString InvidiousClient::resolveStreamUrl(const QString &url, const QUrl &instanceUrl)
+{
+    QUrl parsed(url);
+    if (!parsed.scheme().isEmpty()) {
+        return url; // already a complete URL -- nothing to fix
+    }
+
+    // Known Invidious server-side bug (see iv-org/invidious PR #4992,
+    // "Fix missing host parameter on playback URLs when local=true"):
+    // some instances/versions return adaptiveFormats[].url as a
+    // path-only string (e.g. "/videoplayback?expire=...") instead of a
+    // full URL, when it should have been "proxified" to include the
+    // instance's own scheme+host. Video head fetches then fail with
+    // "Protocol \"\" is unknown" because there's no scheme at all.
+    // Patch it up here using the scheme+host+port of the instance that
+    // actually served this response (reply->url(), passed through as
+    // instanceUrl) -- this is exactly what the instance itself should
+    // have done server-side.
+    QString base = instanceUrl.scheme() + "://" + instanceUrl.authority();
+    if (url.startsWith("/")) {
+        return base + url;
+    }
+    return base + "/" + url;
+}
+
+void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &instanceUrl,
+        StorageData *outStorageData)
 {
     bool liveNow = videoMap["liveNow"].toBool();
 
@@ -270,13 +343,34 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, StorageData 
         QString hlsUrl = videoMap["hlsUrl"].toString();
         if (!hlsUrl.isEmpty()) {
             SingleVideoStorageData live;
-            live.url = hlsUrl;
+            live.url = resolveStreamUrl(hlsUrl, instanceUrl);
             live.quality = "live";
             live.hasEmbeddedAudio = true;
+            // duration intentionally left at its default (0) here --
+            // PlayerPage::playVideo() treats duration == 0 as the signal
+            // for "this is a livestream" (isLiveStream = duration == 0),
+            // which is exactly correct in this liveNow branch.
             outStorageData->instances.append(live);
         }
         return;
     }
+
+    // NOT a livestream past this point. PlayerPage::playVideo() computes
+    // isLiveStream as (instances[0].duration == 0) -- so every instance
+    // below MUST have a real, non-zero duration, or an ordinary video
+    // gets misdetected as a livestream. That misdetection was the actual
+    // root cause of adaptive (video-only) streams being played directly
+    // instead of going through remux: PlayerPage's remux-vs-direct-play
+    // check is `if (!isLiveStream && !data.hasEmbeddedAudio && ...)`, and
+    // duration was never being set here at all (silently staying at the
+    // SingleVideoStorageData default of 0), which made isLiveStream true
+    // for every single video and short-circuited that check.
+    //
+    // lengthSeconds is a per-VIDEO field (not per-format), so this is
+    // computed once here and reused for every instance -- more reliable
+    // than adaptiveFormats[].approxDurationMs, which per Invidious's own
+    // API docs isn't guaranteed present on every format entry.
+    int durationMs = videoMap["lengthSeconds"].toInt() * 1000;
 
     // Progressive (audio+video combined) streams -- these can be played
     // directly, no remux needed. Matches StorageParser's handling of
@@ -290,9 +384,10 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, StorageData 
             continue;
         }
         SingleVideoStorageData instance;
-        instance.url = url;
+        instance.url = resolveStreamUrl(url, instanceUrl);
         instance.quality = fmt["qualityLabel"].toString();
         instance.hasEmbeddedAudio = true;
+        instance.duration = durationMs;
         outStorageData->instances.append(instance);
     }
 
@@ -300,8 +395,76 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, StorageData 
     // pairing with a separate audio track and remuxing (see
     // StreamingRemuxSession) before BB10's mmrenderer can play them.
     QVariantList adaptiveFormats = videoMap["adaptiveFormats"].toList();
+
+    // PASS 1: find the best available audio track first, scanning the
+    // WHOLE adaptiveFormats list. This has to happen before deciding
+    // which video-only entries to keep (pass 2) -- audio and video
+    // entries can appear in any order in the array, so if we only
+    // scanned once and appended video instances as we went, an audio
+    // track appearing later in the list would be missed for instances
+    // already added, leaving storageData.audio.url empty even though a
+    // usable audio track existed. That was silently producing
+    // video-only instances with hasEmbeddedAudio=false but no paired
+    // audio -- which PlayerPage's remux-vs-direct-play check
+    // (!hasEmbeddedAudio && audio.url != "") doesn't catch, so it fell
+    // through to direct playback of a video-only (silent, and on some
+    // devices outright unplayable) stream.
     QString bestAudioUrl;
     unsigned long long bestAudioBitrate = 0;
+    bool bestAudioIsMp4 = false;
+    int audioCandidatesSeen = 0;
+
+    for (int i = 0; i < adaptiveFormats.count(); i++) {
+        QVariantMap fmt = adaptiveFormats[i].toMap();
+        QString url = fmt["url"].toString();
+        if (url.isEmpty()) {
+            continue;
+        }
+        QString type = fmt["type"].toString(); // e.g. "audio/mp4; codecs=\"mp4a.40.2\"" or "audio/webm; codecs=\"opus\""
+        if (!type.startsWith("audio/")) {
+            continue;
+        }
+        audioCandidatesSeen++;
+
+        // mp4_stream_remux (see StreamingRemuxSession) only understands
+        // ISOBMFF/MP4 box structure -- an audio/webm (Opus) track is a
+        // completely different container (EBML) and will never contain
+        // an "ftyp" box no matter how much of it is fetched. Prefer
+        // audio/mp4 unconditionally; only fall back to a non-mp4 track
+        // if no mp4 audio exists at all (matching StorageParser's
+        // InnerTube-path behavior, which does the same for the same
+        // reason).
+        bool isMp4Audio = type.contains("audio/mp4");
+        if (!bestAudioUrl.isEmpty() && bestAudioIsMp4 && !isMp4Audio) {
+            continue; // already have a usable mp4 track -- don't replace it with webm
+        }
+
+        unsigned long long bitrate = fmt["bitrate"].toString().toULongLong();
+        bool shouldReplace = bestAudioUrl.isEmpty()
+                || (isMp4Audio && !bestAudioIsMp4) // upgrade non-mp4 -> mp4 regardless of bitrate
+                || (isMp4Audio == bestAudioIsMp4 && bitrate >= bestAudioBitrate);
+        if (shouldReplace) {
+            bestAudioBitrate = bitrate;
+            bestAudioUrl = url;
+            bestAudioIsMp4 = isMp4Audio;
+        }
+    }
+
+    if (!bestAudioUrl.isEmpty()) {
+        outStorageData->audio.url = resolveStreamUrl(bestAudioUrl, instanceUrl);
+        outStorageData->audio.contentLength = 0; // not surfaced separately by Invidious's schema per-track here
+    }
+
+    // PASS 2: add video-only instances, but ONLY if pass 1 actually
+    // found a usable audio track to pair them with via remux. A
+    // video-only instance with no audio anywhere in this response can't
+    // be played correctly by this app (no remux is possible, and direct
+    // playback would be silent/fail) -- skip adding it entirely rather
+    // than let it become a selectable-but-broken quality option.
+    // formatStreams (progressive, handled above) remain available
+    // regardless, since those already include their own audio.
+    int videoCandidatesAdded = 0;
+    bool hasUsableAudio = !bestAudioUrl.isEmpty();
 
     for (int i = 0; i < adaptiveFormats.count(); i++) {
         QVariantMap fmt = adaptiveFormats[i].toMap();
@@ -311,19 +474,11 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, StorageData 
         }
         QString type = fmt["type"].toString(); // e.g. "video/mp4; codecs=\"avc1.4d401f\""
 
-        if (type.startsWith("audio/")) {
-            // Pick the highest-bitrate audio track available, matching
-            // StorageParser's approach for the InnerTube path.
-            unsigned long long bitrate = fmt["bitrate"].toString().toULongLong();
-            if (bitrate >= bestAudioBitrate) {
-                bestAudioBitrate = bitrate;
-                bestAudioUrl = url;
-            }
-            continue;
-        }
-
         if (!type.startsWith("video/")) {
-            continue;
+            continue; // audio entries already handled in pass 1
+        }
+        if (!hasUsableAudio) {
+            continue; // no audio to pair this with -- see comment above
         }
         // Only H.264 (avc1) mp4 video is usable by BB10's mmrenderer /
         // this app's remuxer -- skip VP9/AV1/webm, matching
@@ -339,17 +494,20 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, StorageData 
         }
 
         SingleVideoStorageData instance;
-        instance.url = url;
+        instance.url = resolveStreamUrl(url, instanceUrl);
         instance.quality = qualityLabel;
         instance.hasEmbeddedAudio = false;
         instance.contentLength = fmt["clen"].toString().toULongLong();
+        instance.duration = durationMs;
         outStorageData->instances.append(instance);
+        videoCandidatesAdded++;
     }
 
-    if (!bestAudioUrl.isEmpty()) {
-        outStorageData->audio.url = bestAudioUrl;
-        outStorageData->audio.contentLength = 0; // not surfaced separately by Invidious's schema per-track here
-    }
+    qDebug() << "[bbtube][invidious] mapToStorageData: adaptiveFormats total ="
+             << adaptiveFormats.count() << ", audio candidates seen =" << audioCandidatesSeen
+             << ", usable audio found?" << hasUsableAudio << ", chosen audio is mp4?" << bestAudioIsMp4
+             << ", video (h264/mp4) instances added =" << videoCandidatesAdded
+             << ", formatStreams (progressive) added =" << outStorageData->instances.count() - videoCandidatesAdded;
 
     qSort(outStorageData->instances.begin(), outStorageData->instances.end(),
             singleVideoStorageDataLessThan);

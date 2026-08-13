@@ -7,6 +7,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QUrl>
 #include <QtNetwork/QNetworkReply>
 #include <QtNetwork/QSslError>
 
@@ -53,6 +54,7 @@ signals:
 private slots:
     void onVideoRequestFinished();
     void onSslErrors(const QList<QSslError> &errors);
+    void onFetchTimeout();
 
 private:
     static const int MAX_INSTANCE_ATTEMPTS = 3;
@@ -67,9 +69,27 @@ private:
     static bool hasUsableStreams(const QVariantMap &videoMap);
 
     static void mapToVideoMetadata(const QVariantMap &videoMap, VideoMetadata *outMetadata);
-    static void mapToStorageData(const QVariantMap &videoMap, StorageData *outStorageData);
+    // instanceUrl: the URL the /api/v1/videos/ request was actually sent
+    // to (i.e. reply->url()) -- used to patch up any stream URL in the
+    // response that's missing its scheme+host. See the large comment
+    // above the definition for why this is needed (an Invidious server
+    // bug, not something on our end).
+    static void mapToStorageData(const QVariantMap &videoMap, const QUrl &instanceUrl,
+            StorageData *outStorageData);
+    // Returns `url` unchanged if it already has a scheme (e.g.
+    // "http://host/videoplayback?..."); otherwise returns it prefixed
+    // with instanceUrl's scheme://host[:port], treating `url` as a
+    // path-only URL relative to the instance that returned it (e.g.
+    // "/videoplayback?..." -> "http://82.40.56.182:14120/videoplayback?...").
+    static QString resolveStreamUrl(const QString &url, const QUrl &instanceUrl);
 
     InvidiousInstanceManager *instanceManager; // not owned
+    // Tracks the in-flight per-instance video request so onFetchTimeout()
+    // can abort() it directly, rather than connecting a QTimer straight
+    // to the reply's abort() slot -- see the identical comment in
+    // InvidiousInstanceManager.hpp for why that approach silently fails
+    // on this BB10/Qt4 build ("No such slot QNetworkReplyImpl::abort()").
+    QNetworkReply *pendingReply;
 };
 
 #endif /* INVIDIOUSCLIENT_HPP_ */

@@ -134,13 +134,28 @@ QString YoutubeClient::getVideoId(QString text)
     }
 
     QUrl url(text);
-    if (!url.isValid()) {
-        return "";
+    if (url.isValid()) {
+        QString videoId = url.queryItemValue("v");
+        if (videoId != "" && url.host().contains("youtube.com")) {
+            return videoId;
+        }
     }
 
-    QString videoId = url.queryItemValue("v");
-    if (videoId != "" && url.host().contains("youtube.com")) {
-        return videoId;
+    // Bare video ID (no URL at all) -- this is the form passed in by
+    // every call site that plays a video the app already knows about
+    // (list item taps in RecommendedPage/TrendingPage/ChannelPage/etc,
+    // PlayerPage's next/prev/up-next navigation, playlist playback --
+    // all of these pass item->id / videoId directly through
+    // BasePage::playVideoByIdOrUrl(), not a full URL). Without this
+    // check, none of those matched either pattern above and got
+    // silently misrouted to search() instead of actually playing.
+    // YouTube video IDs are always exactly 11 characters from
+    // [A-Za-z0-9_-] -- this is deliberately strict (exact length, exact
+    // character set, matches the WHOLE string) so that ordinary search
+    // text doesn't get misinterpreted as a video ID.
+    QRegExp bareIdRegExp("^[A-Za-z0-9_-]{11}$");
+    if (bareIdRegExp.exactMatch(text)) {
+        return text;
     }
 
     return "";

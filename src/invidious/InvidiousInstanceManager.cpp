@@ -14,23 +14,26 @@
 
 // Hardcoded fallback, used only until the first successful
 // refreshInstanceList() -- e.g. very first app launch before any network
-// call has completed, or launched with no connectivity. These are
-// long-standing instances pulled from the official public list at
-// https://docs.invidious.io/instances/ as of when this was written; they
-// are NOT guaranteed to stay up forever, which is exactly why the live
-// list from api.invidious.io (kept current by the Invidious maintainers'
-// uptime/maintenance requirements) is preferred whenever available.
+// call has completed, or launched with no connectivity. This is a
+// snapshot of notPipe.json's "invidious" list as of when this was
+// written (see http://144.31.189.129/notPipe.json) -- these are
+// independently-run instances, NOT guaranteed to stay up forever, which
+// is exactly why the live list (auto-updated by notPipe's maintainers)
+// is preferred whenever available.
 static const char *FALLBACK_INSTANCES[] = {
-    "https://yewtu.be",
-    "https://yt.artemislena.eu",
-    "https://inv.nadeko.net",
-    "https://inv.tux.pizza",
-    "https://invidious.protokolla.fi",
+    "http://76.82.152.76:3000",
+    "http://tube.kronickrusaders.ca:6666",
+    "http://115.73.217.239:3000",
+    "http://51.91.122.148:3000",
+    "http://79.50.199.122:3000",
+    "http://118.71.244.135:1224",
+    "http://yt.nealfcc.top:3000",
+    "http://92.217.193.252",
 };
-static const int FALLBACK_INSTANCES_COUNT = 5;
+static const int FALLBACK_INSTANCES_COUNT = 8;
 
 InvidiousInstanceManager::InvidiousInstanceManager(QObject *parent) :
-        QObject(parent), refreshInFlight(false)
+        QObject(parent), refreshInFlight(false), pendingReply(0)
 {
     // Seed a random source once per app run. qsrand() is process-global in
     // Qt4, so this is intentionally only done here, not per-call.
@@ -44,13 +47,14 @@ void InvidiousInstanceManager::refreshInstanceList()
     }
     refreshInFlight = true;
 
-    QNetworkRequest request(QString("https://api.invidious.io/instances.json?sort_by=type"));
+    QNetworkRequest request(QString("http://144.31.189.129/notPipe.json"));
     // Identify plainly rather than spoofing a browser -- this is a
     // metadata/discovery request, not a YouTube-facing one, so there's no
     // anti-bot concern here.
     request.setRawHeader("User-Agent", "bbtube (BlackBerry 10)");
 
     QNetworkReply *reply = ApplicationUI::networkManager->get(request);
+    pendingReply = reply;
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onInstancesJsonFinished()));
     QObject::connect(reply, SIGNAL(sslErrors(QList<QSslError>)), this,
             SLOT(onSslErrors(QList<QSslError>)));
@@ -60,7 +64,15 @@ void InvidiousInstanceManager::refreshInstanceList()
     // TLS handshake) would otherwise leave finished() never firing,
     // hanging refreshInstanceList() (and by extension, anything waiting
     // on it) indefinitely. 10s is generous for a small JSON fetch.
-    QTimer::singleShot(10000, reply, SLOT(abort()));
+    QTimer::singleShot(10000, this, SLOT(onFetchTimeout()));
+}
+
+void InvidiousInstanceManager::onFetchTimeout()
+{
+    if (pendingReply && !pendingReply->isFinished()) {
+        qDebug() << "[bbtube][invidious] notPipe.json fetch timed out after 10s, aborting";
+        pendingReply->abort(); // triggers finished() -> onInstancesJsonFinished() with an error set
+    }
 }
 
 void InvidiousInstanceManager::onSslErrors(const QList<QSslError> &errors)
@@ -91,11 +103,14 @@ void InvidiousInstanceManager::onInstancesJsonFinished()
     if (!reply) {
         return;
     }
+    if (reply == pendingReply) {
+        pendingReply = 0;
+    }
     reply->deleteLater();
 
     if (reply->error() != QNetworkReply::NoError) {
         QVariant httpStatus = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
-        qDebug() << "[bbtube][invidious] instances.json fetch failed. url:" << reply->url().toString()
+        qDebug() << "[bbtube][invidious] notPipe.json fetch failed. url:" << reply->url().toString()
                  << ", error code:" << reply->error()
                  << ", error string:" << reply->errorString()
                  << ", http status:" << httpStatus;
@@ -107,7 +122,8 @@ void InvidiousInstanceManager::onInstancesJsonFinished()
     QStringList parsed = parseInstancesJson(json);
 
     if (parsed.isEmpty()) {
-        qDebug() << "[bbtube][invidious] instances.json parsed to zero usable instances";
+        qDebug() << "[bbtube][invidious] notPipe.json parsed to zero usable 'invidious' instances."
+                     " First 200 chars of response:" << json.left(200);
         emit instanceListRefreshed(false);
         return;
     }
@@ -123,31 +139,17 @@ QStringList InvidiousInstanceManager::parseInstancesJson(const QString &json)
 
     bb::data::JsonDataAccess jda;
     QVariant parsed = jda.loadFromBuffer(json);
-    QVariantList entries = parsed.toList();
+    QVariantMap root = parsed.toMap();
 
-    // Each entry is a 2-element array: [hostname, {detail object}]. See
-    // https://api.invidious.io/ and the "Instances API" docs -- this
-    // unusual [name, detail] pairing (rather than a plain object keyed by
-    // hostname) is how the Invidious project's own tooling consumes it
-    // (see e.g. https://github.com/tatsumoto-ren/dotfiles's
-    // rank-invidious-instances script, which indexes d[1]['uri'] /
-    // d[1]['monitor']['uptime']).
-    for (int i = 0; i < entries.count(); i++) {
-        QVariantList entry = entries[i].toList();
-        if (entry.count() < 2) {
-            continue;
-        }
-        QVariantMap detail = entry[1].toMap();
+    // notPipe.json's structure: a plain JSON object keyed by backend
+    // type, e.g. {"invidious": ["http://host:port", ...], "yt2009": [...],
+    // "piped": [...], "ytapilegacy": [...]}. We only understand/use the
+    // "invidious" entries -- see the class comment in the header for why
+    // the other three are skipped.
+    QVariantList invidiousEntries = root["invidious"].toList();
 
-        QString type = detail["type"].toString();
-        if (type != "https") {
-            // Skip onion/i2p/http-only entries -- BB10's network stack
-            // and this app's use case (plain HTTPS JSON + video URLs)
-            // has no use for Tor/I2P hidden services.
-            continue;
-        }
-
-        QString uri = detail["uri"].toString();
+    for (int i = 0; i < invidiousEntries.count(); i++) {
+        QString uri = invidiousEntries[i].toString();
         if (uri.isEmpty()) {
             continue;
         }
@@ -156,7 +158,6 @@ QStringList InvidiousInstanceManager::parseInstancesJson(const QString &json)
         while (uri.endsWith("/")) {
             uri.chop(1);
         }
-
         result.append(uri);
     }
 
