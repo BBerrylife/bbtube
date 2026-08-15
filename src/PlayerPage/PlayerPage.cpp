@@ -784,6 +784,14 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
     QString outputPath = remuxOutputPathFor(videoMetadata.video.videoId, videoData.quality);
 
     if (remuxSession) {
+        // cancel() synchronously disconnects and aborts everything so no
+        // slot on the old session can fire again (see its declaration for
+        // why this matters beyond just avoiding a spurious "Source
+        // unavailable" toast -- without it, an in-flight reply's abort()
+        // can synchronously re-enter a slot on a session that's mid-
+        // teardown, which is a use-after-free). deleteLater() then just
+        // handles actual memory reclamation once the event loop gets to it.
+        remuxSession->cancel();
         remuxSession->deleteLater();
         remuxSession = 0;
     }

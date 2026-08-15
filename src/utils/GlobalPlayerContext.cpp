@@ -180,7 +180,22 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::play()
 }
 bb::multimedia::MediaError::Type GlobalPlayerContext::play(QString url)
 {
-    mediaPlayer->setSourceUrl(QUrl(url));
+    // Local filesystem paths (e.g. from the remux cache) have no scheme,
+    // so QUrl(url) parses them with an empty scheme() -- mmrenderer then
+    // can't identify the input type (it tries "playlist"/"autolist"
+    // plugins first and fails with UnsupportedMediaType) even though the
+    // file is a perfectly valid local mp4. Detect that case and build a
+    // proper file:// URI instead. Remote http(s) urls already parse with
+    // a scheme via QUrl(url), so they're left untouched.
+    QUrl mediaUrl = QUrl(url);
+    if (mediaUrl.scheme().isEmpty()) {
+        mediaUrl = QUrl::fromLocalFile(url);
+    }
+    qDebug() << "[bbtube][player] play() input url =" << url
+              << ", scheme =" << QUrl(url).scheme()
+              << ", final mediaUrl =" << mediaUrl.toString()
+              << ", isLocalFile =" << mediaUrl.isLocalFile();
+    mediaPlayer->setSourceUrl(mediaUrl);
     mediaPlayer->prepare();
     bb::multimedia::MediaError::Type error = mediaPlayer->play();
 
@@ -194,7 +209,12 @@ bb::multimedia::MediaError::Type GlobalPlayerContext::changeQuality(QString url)
 {
     int currPosition = mediaPlayer->position();
     bb::multimedia::MediaState::Type currState = mediaPlayer->mediaState();
-    mediaPlayer->setSourceUrl(QUrl(url));
+    // Same scheme-less-local-path issue as play() above -- see comment there.
+    QUrl mediaUrl = QUrl(url);
+    if (mediaUrl.scheme().isEmpty()) {
+        mediaUrl = QUrl::fromLocalFile(url);
+    }
+    mediaPlayer->setSourceUrl(mediaUrl);
     mediaPlayer->prepare();
 
     if (!audioOnly) {

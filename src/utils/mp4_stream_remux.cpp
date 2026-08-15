@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdio.h>
 #include <fstream>
 #include <stdexcept>
 
@@ -58,7 +59,14 @@ struct BoxLoc {
 };
 
 static BoxLoc findBox(const Mp4RemuxBytes &data, size_t start, size_t end, const std::string &type,
-                       bool allowPayloadBeyondEnd = false) {
+                       bool allowPayloadBeyondEnd = false);
+static BoxLoc findBoxOrThrow(const Mp4RemuxBytes &data, size_t start, size_t end,
+                              const std::string &sourceLabel, const char *boxName,
+                              bool allowPayloadBeyondEnd = false);
+static Mp4RemuxBytes makeBox(const std::string &type, const Mp4RemuxBytes &payload);
+
+static BoxLoc findBox(const Mp4RemuxBytes &data, size_t start, size_t end, const std::string &type,
+                       bool allowPayloadBeyondEnd) {
     size_t pos = start;
     while (pos + 8 <= end) {
         uint32_t sz32 = rd32(&data[pos]);
@@ -112,9 +120,333 @@ static Mp4RemuxBytes sliceBox(const Mp4RemuxBytes &data, const BoxLoc &loc) {
     return Mp4RemuxBytes(data.begin() + loc.headerOffset, data.begin() + loc.headerOffset + loc.totalSize);
 }
 
+// ---------------------------------------------------------------------------
+// Fragmented-mp4 (sidx/moof/traf/trun) parsing -- see header for the
+// caller-facing workflow. ISO/IEC 14496-12 box layouts referenced below.
+// ---------------------------------------------------------------------------
+
+// sidx (Segment Index Box), ISO/IEC 14496-12 �8.16.3:
+//   version(1) flags(3) reference_ID(4) timescale(4)
+//   version==0: earliest_presentation_time(4) first_offset(4)
+//   version==1: earliest_presentation_time(8) first_offset(8)
+//   reserved(2) reference_count(2)
+//   reference_count * { reference_type+referenced_size(4)
+//                        subsegment_duration(4)
+//                        starts_with_SAP+SAP_type+SAP_delta_time(4) }
+SidxInfo parseSidx(const Mp4RemuxBytes &headBytes, size_t searchStart, size_t end,
+                    size_t sidxBoxAbsoluteStart) {
+    SidxInfo info;
+    BoxLoc sidx = findBox(headBytes, searchStart, end, "sidx");
+    if (!sidx.found) return info;
+
+    const uint8_t *p = &headBytes[sidx.payloadOffset];
+    size_t payloadLen = sidx.payloadSize;
+    if (payloadLen < 12) return info; // malformed/truncated
+
+    uint8_t version = p[0];
+    size_t off = 4; // skip version+flags
+    off += 4;        // reference_ID
+    off += 4;        // timescale
+    uint64_t firstOffset;
+    if (version == 0) {
+        if (payloadLen < off + 8 + 4) return info;
+        off += 4; // earliest_presentation_time
+        firstOffset = rd32(p + off);
+        off += 4;
+    } else {
+        if (payloadLen < off + 16 + 4) return info;
+        off += 8; // earliest_presentation_time
+        firstOffset = rd64(p + off);
+        off += 8;
+    }
+    if (payloadLen < off + 4) return info;
+    off += 2; // reserved
+    uint16_t referenceCount = uint16_t((uint16_t(p[off]) << 8) | uint16_t(p[off + 1]));
+    off += 2;
+
+    // The sidx box's payload ends at sidxBoxAbsoluteStart + sidx.totalSize
+    // (header+payload). first_offset is relative to that point.
+    info.firstFragmentOffset = sidxBoxAbsoluteStart + sidx.totalSize + size_t(firstOffset);
+
+    for (uint16_t i = 0; i < referenceCount; i++) {
+        if (off + 12 > payloadLen) break; // truncated -- return what we have
+        uint32_t word0 = rd32(p + off);
+        SidxEntry e;
+        e.referencedSize = word0 & 0x7FFFFFFFu; // top bit is reference_type, ignore
+        e.subsegmentDuration = rd32(p + off + 4);
+        info.entries.push_back(e);
+        off += 12;
+    }
+    info.found = true;
+    return info;
+}
+
+// moof (Movie Fragment Box) -> traf (Track Fragment Box) -> tfhd (Track
+// Fragment Header) + trun (Track Fragment Run), ISO/IEC 14496-12 �8.8.
+//
+// tfhd flags bits we care about (low 24 bits of the 4-byte flags field):
+//   0x000001 base-data-offset-present
+//   0x000002 sample-description-index-present
+//   0x000008 default-sample-duration-present
+//   0x000010 default-sample-size-present
+//   0x000020 default-sample-flags-present
+//
+// trun flags bits we care about:
+//   0x000001 data-offset-present
+//   0x000004 first-sample-flags-present
+//   0x000100 sample-duration-present
+//   0x000200 sample-size-present
+//   0x000400 sample-flags-present
+//   0x000800 sample-composition-time-offsets-present
+std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
+                                          size_t fragmentStartOffset,
+                                          const std::string &label) {
+    std::vector<FragSample> out;
+
+    BoxLoc moof = findBoxOrThrow(moofBytes, 0, moofBytes.size(), label, "moof");
+    size_t moofEnd = moof.payloadOffset + moof.payloadSize;
+
+    BoxLoc traf = findBoxOrThrow(moofBytes, moof.payloadOffset, moofEnd, label, "traf");
+    size_t trafStart = traf.payloadOffset, trafEnd = traf.payloadOffset + traf.payloadSize;
+
+    BoxLoc tfhd = findBoxOrThrow(moofBytes, trafStart, trafEnd, label, "tfhd");
+    const uint8_t *tp = &moofBytes[tfhd.payloadOffset];
+    uint32_t tfhdFlags = rd32(tp) & 0x00FFFFFFu; // low 24 bits; byte0 is version
+    size_t tOff = 4;
+    tOff += 4; // track_ID
+    bool haveValidBaseDataOffset = false;
+    uint64_t baseDataOffset = 0;
+    if (tfhdFlags & 0x000001) {
+        baseDataOffset = rd64(tp + tOff);
+        tOff += 8;
+        // Some muxers write base_data_offset==0 as a de facto "unset"
+        // placeholder even though bit 0x000001 is set (seen in the wild
+        // on YouTube/Invidious adaptiveFormats: the first fragment of a
+        // video track can have this, while later fragments and the audio
+        // track use a valid absolute offset or omit the flag entirely).
+        // An absolute byte offset of exactly 0 into a resource that
+        // starts with ftyp/moov/sidx is never actually valid for a media
+        // sample, so treat it the same as the flag being absent below
+        // (default-base-is-moof) rather than trusting it.
+        haveValidBaseDataOffset = (baseDataOffset != 0);
+    }
+    if (tfhdFlags & 0x000002) { tOff += 4; } // sample_description_index
+    uint32_t defaultSampleDuration = 0;
+    if (tfhdFlags & 0x000008) { defaultSampleDuration = rd32(tp + tOff); tOff += 4; }
+    uint32_t defaultSampleSize = 0;
+    if (tfhdFlags & 0x000010) { defaultSampleSize = rd32(tp + tOff); tOff += 4; }
+    if (tfhdFlags & 0x000020) { tOff += 4; } // default_sample_flags
+
+    // moof's total byte length -- needed because trun's data_offset (when
+    // data-offset-present) is relative to the moof's start, and the mdat
+    // payload for this fragment begins right after the moof box ends
+    // (fragmentStartOffset + moof.totalSize), i.e. that's the base if no
+    // base-data-offset was given in tfhd.
+    size_t moofTotalSize = moof.headerOffset == 0 ? moof.payloadOffset + moof.payloadSize
+                                                   : moof.payloadOffset + moof.payloadSize - moof.headerOffset;
+    // moof.headerOffset is 0 here since moofBytes starts at the moof box.
+    (void)moofTotalSize;
+    size_t mdatStartForFragment = fragmentStartOffset + (moof.payloadOffset + moof.payloadSize);
+
+    BoxLoc trun = findBoxOrThrow(moofBytes, trafStart, trafEnd, label, "trun");
+    const uint8_t *rp = &moofBytes[trun.payloadOffset];
+    uint32_t trunFlags = rd32(rp) & 0x00FFFFFFu;
+    size_t rOff = 4;
+    uint32_t sampleCount = rd32(rp + rOff);
+    rOff += 4;
+    int64_t dataOffset = 0;
+    if (trunFlags & 0x000001) { dataOffset = int32_t(rd32(rp + rOff)); rOff += 4; }
+    if (trunFlags & 0x000004) { rOff += 4; } // first_sample_flags
+
+    // Running byte cursor for this trun's samples. If data-offset-present,
+    // it's relative to the moof's start (i.e. fragmentStartOffset); else
+    // if tfhd gave a valid (non-zero) base-data-offset, samples start
+    // there; otherwise fall back to right after the moof box
+    // (default-base-is-moof, per spec, also used when tfhd's
+    // base-data-offset was present but read as the invalid placeholder 0).
+    uint64_t sampleCursor;
+    if (trunFlags & 0x000001) {
+        sampleCursor = uint64_t(int64_t(fragmentStartOffset) + dataOffset);
+    } else if (haveValidBaseDataOffset) {
+        sampleCursor = baseDataOffset;
+    } else {
+        sampleCursor = mdatStartForFragment;
+    }
+
+    out.reserve(sampleCount);
+    for (uint32_t i = 0; i < sampleCount; i++) {
+        FragSample s;
+        uint32_t sampleDuration = defaultSampleDuration;
+        uint32_t sampleSize = defaultSampleSize;
+        if (trunFlags & 0x000100) { sampleDuration = rd32(rp + rOff); rOff += 4; }
+        if (trunFlags & 0x000200) { sampleSize = rd32(rp + rOff); rOff += 4; }
+        if (trunFlags & 0x000400) { rOff += 4; } // sample_flags
+        if (trunFlags & 0x000800) { rOff += 4; } // sample_composition_time_offset
+
+        s.offsetInSource = sampleCursor;
+        s.size = sampleSize;
+        s.duration = sampleDuration;
+        out.push_back(s);
+
+        sampleCursor += sampleSize;
+    }
+    return out;
+}
+
+void buildProgressiveTablesFromFragments(TrackHead &track) {
+    if (track.fragSamples.empty())
+        throw std::runtime_error(track.label + ": buildProgressiveTablesFromFragments called with no samples");
+
+    const std::vector<FragSample> &samples = track.fragSamples;
+
+    // stts: sample count/duration run-length pairs.
+    Mp4RemuxBytes stts;
+    wr32(stts, 0); // version+flags
+    size_t sttsCountPos = stts.size();
+    wr32(stts, 0); // entry_count, patched below
+    uint32_t sttsEntryCount = 0;
+    {
+        size_t i = 0;
+        while (i < samples.size()) {
+            uint32_t dur = samples[i].duration;
+            size_t runStart = i;
+            while (i < samples.size() && samples[i].duration == dur) i++;
+            wr32(stts, uint32_t(i - runStart));
+            wr32(stts, dur);
+            sttsEntryCount++;
+        }
+    }
+    stts[sttsCountPos+0]=uint8_t(sttsEntryCount>>24); stts[sttsCountPos+1]=uint8_t(sttsEntryCount>>16);
+    stts[sttsCountPos+2]=uint8_t(sttsEntryCount>>8);  stts[sttsCountPos+3]=uint8_t(sttsEntryCount);
+    track.sttsBox = makeBox("stts", stts);
+
+    // stsz: per-sample sizes (all samples explicit -- sample_size field is 0).
+    Mp4RemuxBytes stsz;
+    wr32(stsz, 0); // version+flags
+    wr32(stsz, 0); // sample_size == 0 => explicit table below
+    wr32(stsz, uint32_t(samples.size()));
+    for (size_t i = 0; i < samples.size(); i++) wr32(stsz, samples[i].size);
+    track.stszBox = makeBox("stsz", stsz);
+
+    // stsc: one chunk per sample (simplest correct mapping -- chunk i has
+    // exactly 1 sample, sample_description_index 1).
+    Mp4RemuxBytes stsc;
+    wr32(stsc, 0);
+    wr32(stsc, 1); // entry_count
+    wr32(stsc, 1); // first_chunk
+    wr32(stsc, 1); // samples_per_chunk
+    wr32(stsc, 1); // sample_description_index
+    track.stscBox = makeBox("stsc", stsc);
+
+    // stco/co64: one chunk offset per sample. Use co64 if any offset
+    // exceeds 32 bits (large/long videos), else stco.
+    uint64_t maxOffset = 0;
+    for (size_t i = 0; i < samples.size(); i++)
+        if (samples[i].offsetInSource > maxOffset) maxOffset = samples[i].offsetInSource;
+    track.stcoIs64 = maxOffset > 0xFFFFFFFFu;
+
+    Mp4RemuxBytes stco;
+    wr32(stco, 0);
+    wr32(stco, uint32_t(samples.size()));
+    for (size_t i = 0; i < samples.size(); i++) {
+        if (track.stcoIs64) {
+            uint64_t v = samples[i].offsetInSource;
+            stco.push_back(uint8_t(v>>56)); stco.push_back(uint8_t(v>>48));
+            stco.push_back(uint8_t(v>>40)); stco.push_back(uint8_t(v>>32));
+            stco.push_back(uint8_t(v>>24)); stco.push_back(uint8_t(v>>16));
+            stco.push_back(uint8_t(v>>8));  stco.push_back(uint8_t(v));
+        } else {
+            wr32(stco, uint32_t(samples[i].offsetInSource));
+        }
+    }
+    track.stcoBox = makeBox(track.stcoIs64 ? "co64" : "stco", stco);
+
+    // The "mdat" for a fragmented source isn't contiguous in the original
+    // resource, but mdatDeclaredSize is used elsewhere only to size the
+    // OUTPUT mdat span for this track, which body-streaming now fills by
+    // copying each fragment's real mdat bytes into their per-sample output
+    // positions (see StreamingRemuxSession) -- so this is the sum of all
+    // sample sizes, not a source byte range.
+    uint64_t total = 0;
+    for (size_t i = 0; i < samples.size(); i++) total += samples[i].size;
+    track.mdatDeclaredSize = total;
+    track.mdatBodyOffsetInSource = size_t(samples[0].offsetInSource);
+}
+
+// Rebuilds an ftyp box, swapping the major_brand to "isom" (the standard
+// progressive-mp4 brand) and dropping "dash" from the compatible_brands
+// list. Sources fetched from YouTube/Invidious adaptiveFormats are DASH
+// init segments whose ftyp has major_brand == "dash" -- copying that box
+// verbatim into a plain (non-fragmented) output file causes BB10's
+// mmrenderer to reject the file outright (it fails to match any input
+// plugin for that brand and falls through playlist/autolist detection to
+// UnsupportedMediaType) even though the rest of the container is a
+// perfectly valid single-moov/single-mdat mp4. The compatible_brands
+// entries (isom/iso6/avc1/mp41 etc.) are preserved as-is minus "dash".
+static Mp4RemuxBytes rebuildFtypBox(const Mp4RemuxBytes &srcFtypBox) {
+    // srcFtypBox layout: size(4) + "ftyp"(4) + major_brand(4) + minor_version(4)
+    // + compatible_brands(4 each, repeated).
+    if (srcFtypBox.size() < 16) {
+        // Malformed/too-short ftyp -- fall back to a minimal standard one.
+        Mp4RemuxBytes payload;
+        payload.insert(payload.end(), 'i'); payload.insert(payload.end(), 's');
+        payload.insert(payload.end(), 'o'); payload.insert(payload.end(), 'm');
+        wr32(payload, 0); // minor_version
+        payload.insert(payload.end(), 'i'); payload.insert(payload.end(), 's');
+        payload.insert(payload.end(), 'o'); payload.insert(payload.end(), 'm');
+        payload.insert(payload.end(), 'm'); payload.insert(payload.end(), 'p');
+        payload.insert(payload.end(), '4'); payload.insert(payload.end(), '1');
+        Mp4RemuxBytes out;
+        wr32(out, uint32_t(8 + payload.size()));
+        out.insert(out.end(), 'f'); out.insert(out.end(), 't');
+        out.insert(out.end(), 'y'); out.insert(out.end(), 'p');
+        append(out, payload);
+        return out;
+    }
+
+    uint32_t minorVersion = rd32(&srcFtypBox[12]);
+
+    std::vector<std::string> compatBrands;
+    size_t pos = 16;
+    while (pos + 4 <= srcFtypBox.size()) {
+        std::string brand = fourccStr(&srcFtypBox[pos]);
+        if (brand != "dash") {
+            compatBrands.push_back(brand);
+        }
+        pos += 4;
+    }
+    // Make sure "isom" itself is present among compatible brands.
+    bool hasIsom = false;
+    for (size_t i = 0; i < compatBrands.size(); ++i) {
+        if (compatBrands[i] == "isom") { hasIsom = true; break; }
+    }
+    if (!hasIsom) {
+        compatBrands.insert(compatBrands.begin(), "isom");
+    }
+
+    Mp4RemuxBytes payload;
+    // major_brand = "isom"
+    payload.insert(payload.end(), 'i'); payload.insert(payload.end(), 's');
+    payload.insert(payload.end(), 'o'); payload.insert(payload.end(), 'm');
+    wr32(payload, minorVersion);
+    for (size_t i = 0; i < compatBrands.size(); ++i) {
+        const std::string &b = compatBrands[i];
+        for (size_t c = 0; c < 4; ++c) {
+            payload.push_back(c < b.size() ? uint8_t(b[c]) : uint8_t(' '));
+        }
+    }
+
+    Mp4RemuxBytes out;
+    wr32(out, uint32_t(8 + payload.size()));
+    out.insert(out.end(), 'f'); out.insert(out.end(), 't');
+    out.insert(out.end(), 'y'); out.insert(out.end(), 'p');
+    append(out, payload);
+    return out;
+}
+
 static BoxLoc findBoxOrThrow(const Mp4RemuxBytes &data, size_t start, size_t end,
                               const std::string &sourceLabel, const char *boxName,
-                              bool allowPayloadBeyondEnd = false) {
+                              bool allowPayloadBeyondEnd) {
     BoxLoc loc = findBox(data, start, end, boxName, allowPayloadBeyondEnd);
     if (!loc.found)
         throw std::runtime_error(sourceLabel + ": no " + std::string(boxName) +
@@ -132,7 +464,7 @@ TrackHead parseHead(const Mp4RemuxBytes &headBytes, const std::string &label) {
     size_t bufEnd = d.size();
 
     BoxLoc ftyp = findBoxOrThrow(d, 0, bufEnd, label, "ftyp");
-    t.ftypBox = sliceBox(d, ftyp);
+    t.ftypBox = rebuildFtypBox(sliceBox(d, ftyp));
 
     BoxLoc moov = findBoxOrThrow(d, 0, bufEnd, label, "moov");
     BoxLoc mdat = findBoxOrThrow(d, 0, bufEnd, label, "mdat", /*allowPayloadBeyondEnd=*/true);
@@ -189,6 +521,43 @@ TrackHead parseHead(const Mp4RemuxBytes &headBytes, const std::string &label) {
     }
 
     BoxLoc stco = findBox(d, stblStart, stblEnd, "stco");
+    BoxLoc co64 = stco.found ? BoxLoc() : findBox(d, stblStart, stblEnd, "co64");
+    uint32_t stcoEntryCount = 0;
+    if (stco.found && stco.payloadSize >= 8) {
+        stcoEntryCount = rd32(&d[stco.payloadOffset + 4]);
+    } else if (co64.found && co64.payloadSize >= 8) {
+        stcoEntryCount = rd32(&d[co64.payloadOffset + 4]);
+    }
+
+    if (stcoEntryCount == 0) {
+        // Empty stco/co64 (0 entries) means this is a DASH-style
+        // fragmented mp4 (YouTube/Invidious adaptiveFormats): moov only
+        // carries mvex/trex defaults, and the real per-sample offsets live
+        // in each fragment's moof/traf/trun -- see mp4_stream_remux.hpp for
+        // the caller workflow. Leave stts/stsz/stco unpopulated; the
+        // caller must collect fragSamples via parseMoofSamples() and then
+        // call buildProgressiveTablesFromFragments().
+        t.isFragmented = true;
+        // mdat found above (via allowPayloadBeyondEnd) is actually the
+        // FIRST fragment's mdat in this case, not a single track-wide
+        // mdat -- mdatBodyOffsetInSource/mdatDeclaredSize will be
+        // recomputed by buildProgressiveTablesFromFragments() once all
+        // fragments are collected, so clear them here to avoid confusion
+        // if a caller reads them before that.
+        t.mdatBodyOffsetInSource = 0;
+        t.mdatDeclaredSize = 0;
+        // sidx normally sits immediately after moov (before the first
+        // moof). Search the whole head buffer for it; if the head fetch
+        // wasn't large enough to reach it, sidx.found will be false and
+        // the caller must refetch with a larger head size.
+        size_t moovEnd = moov.headerOffset + moov.totalSize;
+        BoxLoc sidxLoc = findBox(d, moovEnd, bufEnd, "sidx");
+        if (sidxLoc.found) {
+            t.sidx = parseSidx(d, moovEnd, bufEnd, sidxLoc.headerOffset);
+        }
+        return t;
+    }
+
     if (stco.found) {
         t.stcoIs64 = false;
         t.stcoBox = sliceBox(d, stco);
@@ -196,6 +565,7 @@ TrackHead parseHead(const Mp4RemuxBytes &headBytes, const std::string &label) {
         t.stcoIs64 = true;
         t.stcoBox = sliceBox(d, findBoxOrThrow(d, stblStart, stblEnd, label, "co64"));
     }
+
     return t;
 }
 
@@ -327,8 +697,23 @@ bool planStreamingRemux(TrackHead &videoHead, TrackHead &audioHead,
 
         int64_t audioDelta = int64_t(audioOutStart) - int64_t(audioHead.mdatBodyOffsetInSource);
         int64_t videoDelta = int64_t(videoOutStart) - int64_t(videoHead.mdatBodyOffsetInSource);
+        fprintf(stderr, "[bbtube][remux][debug] planStreamingRemux "
+                "audioOutStart=%zu audioHead.mdatBodyOffsetInSource=%zu audioDelta=%lld "
+                "videoOutStart=%zu videoHead.mdatBodyOffsetInSource=%zu videoDelta=%lld\n",
+                audioOutStart, audioHead.mdatBodyOffsetInSource, (long long)audioDelta,
+                videoOutStart, videoHead.mdatBodyOffsetInSource, (long long)videoDelta);
         shiftChunkOffsets(audioHead.stcoBox, audioHead.stcoIs64, audioDelta);
         shiftChunkOffsets(videoHead.stcoBox, videoHead.stcoIs64, videoDelta);
+        {
+            uint32_t vEntryCount = videoHead.stcoBox.size() >= 16 ? rd32(&videoHead.stcoBox[12]) : 0;
+            uint32_t aEntryCount = audioHead.stcoBox.size() >= 16 ? rd32(&audioHead.stcoBox[12]) : 0;
+            size_t vEntrySize = videoHead.stcoIs64 ? 8 : 4;
+            size_t aEntrySize = audioHead.stcoIs64 ? 8 : 4;
+            fprintf(stderr, "[bbtube][remux][debug] post-shift stco video[0]=%llu audio[0]=%llu\n",
+                    vEntryCount > 0 ? (unsigned long long)(videoHead.stcoIs64 ? rd64(&videoHead.stcoBox[16]) : rd32(&videoHead.stcoBox[16])) : 0ULL,
+                    aEntryCount > 0 ? (unsigned long long)(audioHead.stcoIs64 ? rd64(&audioHead.stcoBox[16]) : rd32(&audioHead.stcoBox[16])) : 0ULL);
+            (void)vEntrySize; (void)aEntrySize;
+        }
 
         Mp4RemuxBytes finalHead = buildFtypMoov(videoHead, audioHead);
         if (finalHead.size() != head.size())

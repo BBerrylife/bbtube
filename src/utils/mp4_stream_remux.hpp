@@ -33,7 +33,35 @@
 
 typedef std::vector<uint8_t> Mp4RemuxBytes;
 
-// Metadata + sample tables for one track (video-only or audio-only source),
+// One entry from a parsed 'sidx' (segment index) box: byte range and
+// duration of one fragment (a moof+mdat pair) within the source resource,
+// relative to the position right after the sidx box itself.
+struct SidxEntry {
+    uint64_t referencedSize;   // bytes of this fragment (moof+mdat)
+    uint32_t subsegmentDuration;
+    SidxEntry() : referencedSize(0), subsegmentDuration(0) {}
+};
+
+// Result of parsing a 'sidx' box: where fragments start (byte offset in
+// the source resource, right after the sidx box) and the list of
+// fragments that follow it.
+struct SidxInfo {
+    size_t firstFragmentOffset; // absolute byte offset in the source resource
+    std::vector<SidxEntry> entries;
+    bool found;
+    SidxInfo() : firstFragmentOffset(0), found(false) {}
+};
+
+// One decoded sample (from a 'trun' box) with its absolute byte offset
+// and size within the source resource's mdat payload area.
+struct FragSample {
+    uint64_t offsetInSource; // absolute byte offset in the source resource
+    uint32_t size;
+    uint32_t duration;       // in the track's timescale
+    FragSample() : offsetInSource(0), size(0), duration(0) {}
+};
+
+// Metadata for one track (video-only or audio-only source),
 // parsed from just the HEAD bytes of that source -- no mdat payload needed.
 struct TrackHead {
     std::string label;
@@ -51,8 +79,18 @@ struct TrackHead {
 
     Mp4RemuxBytes ftypBox;
 
+    // Fragmented-mp4 (DASH adaptiveFormats) support. When isFragmented is
+    // true, sttsBox/stszBox/stcoBox above are NOT populated by parseHead;
+    // instead sidx is set and the caller must fetch each fragment's moof
+    // header (see FragSample/parseMoofSamples) and then call
+    // buildProgressiveTablesFromFragments() to populate the sample tables
+    // before planStreamingRemux() is used.
+    bool isFragmented;
+    SidxInfo sidx;
+    std::vector<FragSample> fragSamples; // filled in across all fragments, in order
+
     TrackHead() : isVideo(false), timescale(0), duration(0), stcoIs64(false),
-                  mdatBodyOffsetInSource(0), mdatDeclaredSize(0) {}
+                  mdatBodyOffsetInSource(0), mdatDeclaredSize(0), isFragmented(false) {}
 };
 
 // Parses ftyp/moov/mdat-header out of `headBytes` (a prefix of the source
@@ -79,6 +117,64 @@ struct RemuxPlan {
 // chunk offsets to their final output positions) -- pass by non-const ref.
 bool planStreamingRemux(TrackHead &videoHead, TrackHead &audioHead,
                          RemuxPlan *outPlan, std::string *errorOut);
+
+// --- Fragmented-mp4 (DASH adaptiveFormats) support -------------------------
+//
+// YouTube/Invidious adaptiveFormats URLs serve DASH-style fragmented mp4:
+// ftyp + moov (no real sample table -- just mvex/trex defaults) + sidx +
+// a sequence of (moof + mdat) fragment pairs. parseHead() detects this
+// (moov's stbl has an empty stco -- 0 entries) and sets isVideo/timescale/
+// duration/ftypBox as before, plus isFragmented=true and (if a sidx box is
+// present in headBytes) sidx.
+//
+// Caller workflow for a fragmented TrackHead:
+//   1) parseHead() as usual. If result.isFragmented is true, continue below;
+//      the usual sttsBox/stszBox/stcoBox are left empty.
+//   2) If result.sidx.found is false, the head fetch wasn't large enough to
+//      reach the sidx box -- refetch with a bigger head size and retry
+//      parseHead(). (sidx normally sits right after moov, so this is rare.)
+//   3) For each SidxEntry in result.sidx.entries (in order), issue a small
+//      Range request for that fragment's moof (NOT its mdat payload -- moof
+//      is typically a few hundred bytes at the start of the fragment) and
+//      call parseMoofSamples() on the bytes received, passing the
+//      fragment's absolute start offset (running sum of sidx.entries[i].
+//      referencedSize, starting at sidx.firstFragmentOffset) and the
+//      track's timescale. Append the returned samples to
+//      result.fragSamples in fragment order.
+//   4) Once every fragment's samples have been collected, call
+//      buildProgressiveTablesFromFragments(result) to synthesize sttsBox/
+//      stszBox/stcoBox/stscBox (stcoIs64 as needed) from result.fragSamples,
+//      and mdatBodyOffsetInSource/mdatDeclaredSize spanning the *first*
+//      sample to the *last* sample's end. From here on the TrackHead behaves
+//      exactly like a non-fragmented one for planStreamingRemux() -- except
+//      the source is no longer contiguous, so body streaming must fetch each
+//      fragment's mdat individually (see StreamingRemuxSession) rather than
+//      a single "Range: bytes=X-" covering the whole tail.
+
+// Parses a 'sidx' box located anywhere in headBytes[searchStart,end).
+// fragmentBaseOffset is the absolute byte offset in the source resource of
+// the sidx box's OWN start (needed because sidx's first_offset field, if
+// nonzero, is relative to the byte right after the sidx box). Returns a
+// SidxInfo with found=false if no sidx box is present in range.
+SidxInfo parseSidx(const Mp4RemuxBytes &headBytes, size_t searchStart, size_t end,
+                    size_t sidxBoxAbsoluteStart);
+
+// Parses one fragment's 'moof' box (moofBytes = just that fragment's moof,
+// NOT including its mdat) and returns the samples it describes, with
+// offsetInSource computed as fragmentStartOffset + (this fragment's moof
+// size) + (per-sample offset from trun/tfhd). fragmentStartOffset is this
+// fragment's absolute byte offset in the source resource (i.e. where its
+// moof begins). Throws std::runtime_error if moofBytes doesn't contain a
+// complete moof/traf/trun.
+std::vector<FragSample> parseMoofSamples(const Mp4RemuxBytes &moofBytes,
+                                          size_t fragmentStartOffset,
+                                          const std::string &label);
+
+// Synthesizes sttsBox/stszBox/stscBox/stcoBox (and stcoIs64,
+// mdatBodyOffsetInSource, mdatDeclaredSize) from track.fragSamples (must be
+// non-empty and in playback order). Leaves everything else in `track`
+// untouched. Throws std::runtime_error on empty fragSamples.
+void buildProgressiveTablesFromFragments(TrackHead &track);
 
 // Creates/truncates outputPath, resizes it to plan.totalOutputSize, and
 // writes plan.headBytes at offset 0. After this call the file is
