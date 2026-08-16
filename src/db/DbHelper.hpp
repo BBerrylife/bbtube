@@ -29,6 +29,8 @@ public:
     static void setDefautTab(QString tab);
     static QString defaultQuality();
     static void setDefautQuality(QString quality);
+    static bool isDebugLogToFile();
+    static void setDebugLogToFile(bool value);
     static void runMigrations();
 
     static void createChannel(const ChannelListItemModel *channel);

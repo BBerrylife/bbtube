@@ -1,6 +1,7 @@
 #include "SettingsSheet.hpp"
 #include "src/applicationui.hpp"
 #include "src/auth/GoogleLoginSheet.hpp"
+#include "src/utils/FileLogger.hpp"
 
 #include <bb/cascades/Page>
 #include <bb/cascades/Container>
@@ -101,6 +102,41 @@ SettingsSheet::SettingsSheet() :
 
     container->add(Divider::create());
 
+    Container *debugLogLabelContainer = Container::create().topMargin(ui->du(1));
+    Label *debugLogTitleLabel = Label::create().text("Export Debug Log");
+    debugLogTitleLabel->textStyle()->setBase(SystemDefaults::TextStyles::titleText());
+    debugLogLabelContainer->add(debugLogTitleLabel);
+    container->add(debugLogLabelContainer);
+
+    Container *debugLogContainer = Container::create().topMargin(ui->du(1));
+    StackLayout *debugLogLayout = new StackLayout();
+    debugLogLayout->setOrientation(LayoutOrientation::LeftToRight);
+    debugLogContainer->setLayout(debugLogLayout);
+    Container *debugLogButtonLabelContainer = Container::create().layoutProperties(
+            StackLayoutProperties::create().spaceQuota(1));
+    debugLogButtonLabelContainer->setVerticalAlignment(VerticalAlignment::Center);
+    Label *debugLogButtonLabel = Label::create().text("Save debug log to file").multiline(true);
+    debugLogButtonLabel->textStyle()->setBase(SystemDefaults::TextStyles::titleText());
+    debugLogButtonLabelContainer->add(debugLogButtonLabel);
+    debugLogButton = ToggleButton::create().checked(appSettings->isDebugLogToFile());
+    debugLogContainer->add(debugLogButtonLabelContainer);
+    debugLogContainer->add(debugLogButton);
+    container->add(debugLogContainer);
+
+    Container *debugLogCommentContainer = Container::create();
+    debugLogCommentContainer->setTopMargin(ui->du(1));
+    debugLogCommentContainer->setHorizontalAlignment(HorizontalAlignment::Fill);
+    Label *debugLogCommentLabel = Label::create().multiline(true);
+    debugLogCommentLabel->setText(
+            "when on, app log messages are appended to a file so they can be reviewed "
+                    "after the fact even if the console log was cut short. saved to:\n"
+            + FileLogger::logFilePath());
+    debugLogCommentLabel->textStyle()->setBase(SystemDefaults::TextStyles::subtitleText());
+    debugLogCommentContainer->add(debugLogCommentLabel);
+    container->add(debugLogCommentContainer);
+
+    container->add(Divider::create());
+
     Container *googleAccountLabelContainer = Container::create().topMargin(ui->du(1));
     Label *googleAccountTitleLabel = Label::create().text("Google Account");
     googleAccountTitleLabel->textStyle()->setBase(SystemDefaults::TextStyles::titleText());
@@ -159,6 +195,7 @@ void SettingsSheet::saveActionClick()
     appSettings->setPlaybackTimeout(playbackTimeout);
     appSettings->setDefaultTab(tabDropdown->selectedValue().toString());
     appSettings->setDefaultQuality(qualityDropdown->selectedValue().toString());
+    appSettings->setDebugLogToFile(debugLogButton->isChecked());
 
     closeSheet();
 }

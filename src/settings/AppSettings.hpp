@@ -2,6 +2,7 @@
 #define APPSETTINGS_HPP_
 
 #include "src/db/DbHelper.hpp"
+#include "src/utils/FileLogger.hpp"
 
 class AppSettings: public QObject
 {
@@ -14,6 +15,7 @@ public:
         playbackTimeout = DbHelper::getPlaybackTimeout();
         tab = DbHelper::defaultTab();
         quality = DbHelper::defaultQuality();
+        debugLogToFile = DbHelper::isDebugLogToFile();
     }
     ~AppSettings()
     {
@@ -64,14 +66,29 @@ public:
             DbHelper::setDefautQuality(value);
         }
     }
+    bool isDebugLogToFile()
+    {
+        return debugLogToFile;
+    }
+    void setDebugLogToFile(bool value)
+    {
+        if (debugLogToFile != value) {
+            debugLogToFile = value;
+            DbHelper::setDebugLogToFile(value);
+            FileLogger::setEnabled(value);
+            emit debugLogToFileChanged(value);
+        }
+    }
 signals:
     void autoplayChanged(bool value);
     void playbackTimeoutChanged(int value);
+    void debugLogToFileChanged(bool value);
 private:
     bool autoplay;
     int playbackTimeout;
     QString tab;
     QString quality;
+    bool debugLogToFile;
 };
 
 #endif /* APPSETTINGS_HPP_ */

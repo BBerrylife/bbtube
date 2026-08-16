@@ -94,6 +94,7 @@ config_pri_assets {
         $$quote($$BASEDIR/assets/sql/Script000005.sql) \
         $$quote($$BASEDIR/assets/sql/Script000006.sql) \
         $$quote($$BASEDIR/assets/sql/Script000007.sql) \
+        $$quote($$BASEDIR/assets/sql/Script000008.sql) \
         $$quote($$BASEDIR/assets/youtube.db)
 }
 
@@ -144,6 +145,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/BasePage.cpp) \
         $$quote($$BASEDIR/src/utils/BaseSheet.cpp) \
         $$quote($$BASEDIR/src/utils/ChannelListProxy.cpp) \
+        $$quote($$BASEDIR/src/utils/FileLogger.cpp) \
         $$quote($$BASEDIR/src/utils/GlobalPlayerContext.cpp) \
         $$quote($$BASEDIR/src/utils/MiniPlayer.cpp) \
         $$quote($$BASEDIR/src/utils/PlaylistSheet.cpp) \
@@ -226,6 +228,7 @@ config_pri_source_group1 {
         $$quote($$BASEDIR/src/utils/ChannelListProxy.hpp) \
         $$quote($$BASEDIR/src/utils/CustomListView.hpp) \
         $$quote($$BASEDIR/src/utils/DateTimeUtils.hpp) \
+        $$quote($$BASEDIR/src/utils/FileLogger.hpp) \
         $$quote($$BASEDIR/src/utils/GlobalPlayerContext.hpp) \
         $$quote($$BASEDIR/src/utils/MiniPlayer.hpp) \
         $$quote($$BASEDIR/src/utils/PlaybackTimeoutHandler.hpp) \

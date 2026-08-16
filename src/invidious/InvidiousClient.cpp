@@ -493,6 +493,21 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &
             continue;
         }
 
+        // Cap at 720p: 1080p (itag 137/299, 30fps or 60fps) has proven
+        // unreliable on-device -- the remux plus mmrenderer playback of a
+        // video that large regularly triggers a low-memory kill (see the
+        // "received low memory signal" crashes in device logs), and the
+        // long download window at that bitrate/duration also gives flaky
+        // Invidious proxies more opportunity to drop a request mid-stream.
+        // 720p (itag 136/298) is comfortably smaller and has been stable,
+        // so don't even offer anything above it in the quality picker.
+        // qualityLabelToNumber() (below) already exists in this file for
+        // sorting instances by resolution, so reuse it here rather than
+        // duplicating the "parse leading digits" logic.
+        if (qualityLabelToNumber(qualityLabel) > 720) {
+            continue;
+        }
+
         SingleVideoStorageData instance;
         instance.url = resolveStreamUrl(url, instanceUrl);
         instance.quality = qualityLabel;

@@ -14,6 +14,7 @@
 #include "src/utils/PlaylistVideoProxy.hpp"
 #include "src/utils/VideoViewedPercentProxy.hpp"
 #include "src/utils/SslTrust.hpp"
+#include "src/utils/FileLogger.hpp"
 
 #include <bb/cascades/Application>
 #include <bb/cascades/Page>
@@ -44,6 +45,10 @@ ApplicationUI::ApplicationUI() :
     QTextCodec::setCodecForCStrings(QTextCodec::codecForName("UTF-8"));
     SslTrust::installExtraRootCertificates();
     DbHelper::runMigrations();
+    // Must come right after runMigrations() (needs the Settings table to
+    // read the persisted debugLogToFile flag) and before anything else
+    // gets a chance to qDebug()/qWarning() -- see FileLogger.hpp.
+    FileLogger::install();
 
     networkManager = new QNetworkAccessManager(this);
     playerContext = new GlobalPlayerContext(this);

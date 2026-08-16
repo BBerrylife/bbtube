@@ -160,6 +160,25 @@ void StorageParser::parseFromJsonInternal(StorageData *storageData,
                 continue; // skip webm/vp9 and av1 — not decodable on BB10 hardware
             }
 
+            // Cap at 720p: 1080p60 (itag 299) has proven unreliable on-device
+            // -- the remux plus mmrenderer playback of a video that large
+            // regularly triggers a low-memory kill (see the
+            // "received low memory signal" crashes in device logs), and the
+            // long download window at that bitrate/duration also gives
+            // flaky Invidious proxies more opportunity to drop a request
+            // mid-stream (e.g. an unexpected HTTP 302 partway through
+            // fragment discovery). 720p60 (itag 298) is comfortably smaller
+            // and has been stable, so until 1080p is worth the risk again,
+            // don't even offer it in the quality picker. Checking the
+            // numeric "height" field rather than string-matching
+            // qualityLabel (e.g. "1080p60") is deliberate: YouTube's label
+            // text/formatting isn't guaranteed stable across responses, but
+            // height is a plain integer.
+            int height = format["height"].toInt();
+            if (height > 720) {
+                continue;
+            }
+
             SingleVideoStorageData video;
             video.quality = format["qualityLabel"].toString();
             video.duration = format["approxDurationMs"].toInt();

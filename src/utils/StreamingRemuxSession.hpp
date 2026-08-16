@@ -105,6 +105,7 @@ private:
     // Fragment-discovery helpers (fragmented sources only).
     void beginFragmentDiscovery(TrackHead &track, bool isVideoTrack);
     void dispatchMoofRequests(bool isVideoTrack); // fills the concurrency window
+    void retryMoofRequest(bool isVideoTrack, size_t fragIndex); // re-issues a single fragment after a transient failure
     void onTrackFragmentsReady(bool isVideoTrack);
 
     // Fragment-by-fragment body streaming helpers (fragmented sources only).
@@ -158,6 +159,14 @@ private:
     std::vector<uint64_t> m_audioFragOffsets;
     QList<QNetworkReply *> m_videoMoofReplies; // in-flight, order not significant
     QList<QNetworkReply *> m_audioMoofReplies;
+    // Per-fragment retry counters for transient moof-fetch network errors
+    // (e.g. a dropped connection on the videoplayback edge server when
+    // several Range requests hit it concurrently). Indexed by fragment
+    // number, sized/zeroed alongside m_video/audioFragSlots in
+    // beginFragmentDiscovery(); a fragment that exhausts
+    // MOOF_MAX_RETRIES still fails the session via failWith() as before.
+    std::vector<int> m_videoFragRetries;
+    std::vector<int> m_audioFragRetries;
     // Per-fragment sample storage, indexed by fragment number -- needed
     // because completions arrive out of dispatch order once several
     // requests run concurrently, so samples can't just be appended to
@@ -171,8 +180,24 @@ private:
     // request and the per-sample output offset), plus a running total of
     // bytes already written for this track so each write's output offset
     // is O(1) to compute instead of re-summing every prior sample size.
+    //
+    // Samples are NOT fetched one at a time -- a long video can have tens
+    // of thousands of samples, and one HTTP Range request per sample was
+    // both extremely slow and, worse, occasionally returned a
+    // wrong-but-right-sized body (matching the requested Content-Length
+    // without actually being that byte range) with no error, silently
+    // writing garbage into the output at exactly the point another
+    // sample's data belonged -- the video-turns-green/audio-repeats-a-
+    // syllable corruption this batching fixes. Instead, requestNextFragBody()
+    // groups consecutive samples whose offsetInSource run contiguously
+    // (which all samples within -- and typically across -- a fragment do)
+    // into a single Range request up to FRAG_BODY_BATCH_BYTES, and the
+    // Finished handler splits that one response back into per-sample
+    // writes using m_video/audioFragBodyBatchCount.
     size_t m_videoFragBodyIndex;
     size_t m_audioFragBodyIndex;
+    size_t m_videoFragBodyBatchCount; // number of samples covered by the in-flight request
+    size_t m_audioFragBodyBatchCount;
     qint64 m_videoFragBodyOffsetSoFar;
     qint64 m_audioFragBodyOffsetSoFar;
     QNetworkReply *m_videoFragBodyReply;

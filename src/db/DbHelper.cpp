@@ -193,6 +193,41 @@ void DbHelper::setAutoplay(bool value)
     }
 }
 
+bool DbHelper::isDebugLogToFile()
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare(
+            "SELECT CAST([Value] AS int) as [Value] FROM Settings WHERE [Key] = 'debugLogToFile';");
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+
+    QSqlRecord rec = query.record();
+    query.next();
+
+    return query.value(rec.indexOf("Value")).toString() == "1";
+}
+
+void DbHelper::setDebugLogToFile(bool value)
+{
+    QSqlQuery query(getDbContext());
+
+    query.prepare("UPDATE Settings SET [Value] = :value WHERE [Key] = 'debugLogToFile';");
+    query.bindValue(":value", value ? "1" : "0");
+    query.exec();
+
+    QSqlError err = query.lastError();
+
+    if (err.isValid()) {
+        qWarning() << "SQL reported an error : " << err.text();
+    }
+}
+
 QString DbHelper::defaultTab()
 {
     QSqlQuery query(getDbContext());

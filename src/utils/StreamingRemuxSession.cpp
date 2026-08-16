@@ -37,6 +37,19 @@ static const int MOOF_DISCOVERY_FETCH_BYTES = 8 * 1024;
 // dozens) to avoid overwhelming the Invidious instance or BB10's own
 // concurrent-connection handling.
 static const int MOOF_DISCOVERY_CONCURRENCY = 5;
+// Transient network errors on a moof header fetch (dropped connection,
+// timeout, occasional edge-server reset when several Range requests hit
+// the same videoplayback URL concurrently) are retried this many times
+// before giving up and failing the whole remux session.
+static const int MOOF_MAX_RETRIES = 3;
+// Upper bound, in bytes, for how much a single grouped fragment-body
+// Range request is allowed to cover -- see the comment on
+// m_video/audioFragBodyBatchCount in the header for why samples are
+// batched at all. 4 MiB keeps individual requests/responses (and the
+// in-memory QByteArray holding one) comfortably small for BB10's limited
+// RAM while still cutting a 44k-sample video down to a few hundred
+// requests instead of 44k.
+static const qint64 FRAG_BODY_BATCH_BYTES = 4 * 1024 * 1024;
 
 static Mp4RemuxBytes qByteArrayToBytes(const QByteArray &arr)
 {
@@ -55,7 +68,8 @@ StreamingRemuxSession::StreamingRemuxSession(QNetworkAccessManager *networkManag
                 0), m_audioDone(false), m_videoDone(false), m_videoFragmentsReady(false), m_audioFragmentsReady(
                 false), m_videoFragDiscoveryIndex(0), m_audioFragDiscoveryIndex(0), m_videoFragDiscoveryCompleted(
                 0), m_audioFragDiscoveryCompleted(0), m_videoFragBodyIndex(
-                0), m_audioFragBodyIndex(0), m_videoFragBodyOffsetSoFar(0), m_audioFragBodyOffsetSoFar(
+                0), m_audioFragBodyIndex(0), m_videoFragBodyBatchCount(
+                0), m_audioFragBodyBatchCount(0), m_videoFragBodyOffsetSoFar(0), m_audioFragBodyOffsetSoFar(
                 0), m_videoFragBodyReply(0), m_audioFragBodyReply(0)
 {
 }
@@ -177,7 +191,20 @@ void StreamingRemuxSession::onVideoHeadFinished()
             requestVideoHead();
             return;
         }
-        m_videoHeadParsed = true;
+        // NOTE: m_videoHeadParsed is intentionally NOT set here for the
+        // fragmented case -- tryBeginPlan() uses this flag as its sole
+        // "video track is ready to plan" gate, and for fragmented
+        // sources the track isn't actually ready until fragment
+        // discovery has populated fragSamples/mdatBodyOffsetInSource via
+        // onTrackFragmentsReady(). Setting it early here let audio
+        // finish first and call tryBeginPlan() while m_videoHead was
+        // still a default-constructed/partial head (mdatBodyOffsetInSource
+        // == 0, fragSamples empty), which planStreamingRemux() would
+        // then plan against -- corrupting the output offset table and
+        // crashing later on an unrelated allocation.
+        if (!m_videoHead.isFragmented) {
+            m_videoHeadParsed = true;
+        }
     } catch (const std::exception &e) {
         if (m_videoHeadFetchSize >= MAX_HEAD_FETCH_BYTES) {
             failWith(QString("video head parse failed (giving up after %1 bytes): %2")
@@ -228,7 +255,15 @@ void StreamingRemuxSession::onAudioHeadFinished()
             requestAudioHead();
             return;
         }
-        m_audioHeadParsed = true;
+        // See matching comment in onVideoHeadFinished(): don't mark the
+        // track "parsed"/ready-to-plan here for fragmented sources --
+        // that only becomes true once fragment discovery finishes
+        // (onTrackFragmentsReady), or tryBeginPlan() can run against a
+        // still-empty m_audioHead if video's head happens to finish
+        // first.
+        if (!m_audioHead.isFragmented) {
+            m_audioHeadParsed = true;
+        }
     } catch (const std::exception &e) {
         if (m_audioHeadFetchSize >= MAX_HEAD_FETCH_BYTES) {
             failWith(QString("audio head parse failed (giving up after %1 bytes): %2")
@@ -310,8 +345,10 @@ void StreamingRemuxSession::beginFragmentDiscovery(TrackHead &track, bool isVide
 
     if (isVideoTrack) {
         m_videoFragSlots.assign(track.sidx.entries.size(), std::vector<FragSample>());
+        m_videoFragRetries.assign(track.sidx.entries.size(), 0);
     } else {
         m_audioFragSlots.assign(track.sidx.entries.size(), std::vector<FragSample>());
+        m_audioFragRetries.assign(track.sidx.entries.size(), 0);
     }
 
     dispatchMoofRequests(isVideoTrack);
@@ -354,6 +391,43 @@ void StreamingRemuxSession::dispatchMoofRequests(bool isVideoTrack)
         }
         nextIdx++;
     }
+}
+
+// Re-issues the moof request for a single fragment that just failed with
+// a (presumed transient) network error, without touching the discovery
+// cursor/window -- dispatchMoofRequests() only ever moves nextIdx
+// forward, so a failed fragment's slot would otherwise never be
+// requested again. The reply is wired to the same onVideo/AudioMoofFinished
+// slot as a normal dispatch; that slot's existing retry-count check
+// decides whether a further failure retries again or gives up.
+void StreamingRemuxSession::retryMoofRequest(bool isVideoTrack, size_t fragIndex)
+{
+    TrackHead &track = isVideoTrack ? m_videoHead : m_audioHead;
+    const std::vector<uint64_t> &offsets = isVideoTrack ? m_videoFragOffsets : m_audioFragOffsets;
+    QList<QNetworkReply *> &inFlight = isVideoTrack ? m_videoMoofReplies : m_audioMoofReplies;
+    QString url = isVideoTrack ? m_videoUrl : m_audioUrl;
+    int retryCount = isVideoTrack ? m_videoFragRetries[fragIndex] : m_audioFragRetries[fragIndex];
+
+    uint64_t offset = offsets[fragIndex];
+    QNetworkRequest req(QUrl::fromEncoded(url.toUtf8()));
+    qint64 rangeEnd = qint64(offset) + MOOF_DISCOVERY_FETCH_BYTES - 1;
+    QByteArray rangeHeader = "bytes=" + QByteArray::number(qint64(offset)) + "-"
+            + QByteArray::number(rangeEnd);
+    req.setRawHeader("Range", rangeHeader);
+
+    qDebug() << "[bbtube][remux][debug] retryMoofRequest" << (isVideoTrack ? "video" : "audio")
+             << "fragIndex=" << qint64(fragIndex) << "attempt=" << (retryCount + 1)
+             << "of" << MOOF_MAX_RETRIES << "offset=" << qint64(offset) << "range=" << rangeHeader;
+
+    QNetworkReply *reply = m_networkManager->get(req);
+    reply->setProperty("fragIndex", qint64(fragIndex));
+    inFlight.append(reply);
+    if (isVideoTrack) {
+        QObject::connect(reply, SIGNAL(finished()), this, SLOT(onVideoMoofFinished()));
+    } else {
+        QObject::connect(reply, SIGNAL(finished()), this, SLOT(onAudioMoofFinished()));
+    }
+    (void)track; // kept for symmetry/future use, silences unused-variable warning on some toolchains
 
     // All fragments dispatched and none still in flight -- but only once
     // every fragment has actually COMPLETED (not just been dispatched) is
@@ -378,7 +452,23 @@ void StreamingRemuxSession::onVideoMoofFinished()
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith(QString("video fragment %1 header fetch failed: %2").arg(fragIndex).arg(msg));
+        // Transient network errors (dropped connection, timeout, an edge
+        // server hiccup from MOOF_DISCOVERY_CONCURRENCY simultaneous
+        // Range requests hitting the same videoplayback URL) are common
+        // enough here that failing the whole remux session on the first
+        // one is too aggressive -- retry this single fragment a few
+        // times before giving up.
+        int &retryCount = m_videoFragRetries[size_t(fragIndex)];
+        if (retryCount < MOOF_MAX_RETRIES) {
+            retryCount++;
+            qDebug() << "[bbtube][remux] video fragment" << fragIndex
+                     << "header fetch failed (" << msg << ") - retrying, attempt"
+                     << retryCount << "of" << MOOF_MAX_RETRIES;
+            retryMoofRequest(true, size_t(fragIndex));
+            return;
+        }
+        failWith(QString("video fragment %1 header fetch failed after %2 retries: %3")
+                .arg(fragIndex).arg(MOOF_MAX_RETRIES).arg(msg));
         return;
     }
     Mp4RemuxBytes buf = qByteArrayToBytes(reply->readAll());
@@ -415,10 +505,28 @@ void StreamingRemuxSession::onAudioMoofFinished()
     m_audioMoofReplies.removeOne(reply);
     qint64 fragIndex = reply->property("fragIndex").toLongLong();
 
+    qDebug() << "[bbtube][remux][debug] onAudioMoofFinished fragIndex=" << fragIndex
+             << "error=" << int(reply->error()) << "errorString=" << reply->errorString()
+             << "httpStatus=" << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute)
+             << "bytesAvailable=" << reply->bytesAvailable() << "url=" << reply->url().toString();
+
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith(QString("audio fragment %1 header fetch failed: %2").arg(fragIndex).arg(msg));
+        // See matching comment in onVideoMoofFinished(): retry a single
+        // fragment a few times on transient network errors before
+        // failing the whole session.
+        int &retryCount = m_audioFragRetries[size_t(fragIndex)];
+        if (retryCount < MOOF_MAX_RETRIES) {
+            retryCount++;
+            qDebug() << "[bbtube][remux] audio fragment" << fragIndex
+                     << "header fetch failed (" << msg << ") - retrying, attempt"
+                     << retryCount << "of" << MOOF_MAX_RETRIES;
+            retryMoofRequest(false, size_t(fragIndex));
+            return;
+        }
+        failWith(QString("audio fragment %1 header fetch failed after %2 retries: %3")
+                .arg(fragIndex).arg(MOOF_MAX_RETRIES).arg(msg));
         return;
     }
     Mp4RemuxBytes buf = qByteArrayToBytes(reply->readAll());
@@ -658,6 +766,8 @@ void StreamingRemuxSession::beginFragmentedBodyDownloads()
 
     m_videoFragBodyIndex = 0;
     m_audioFragBodyIndex = 0;
+    m_videoFragBodyBatchCount = 0;
+    m_audioFragBodyBatchCount = 0;
     m_videoFragBodyOffsetSoFar = 0;
     m_audioFragBodyOffsetSoFar = 0;
     requestNextFragBody(true);
@@ -668,6 +778,7 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
 {
     TrackHead &track = isVideoTrack ? m_videoHead : m_audioHead;
     size_t &idx = isVideoTrack ? m_videoFragBodyIndex : m_audioFragBodyIndex;
+    size_t &batchCount = isVideoTrack ? m_videoFragBodyBatchCount : m_audioFragBodyBatchCount;
 
     if (idx >= track.fragSamples.size()) {
         if (isVideoTrack) { m_videoDone = true; } else { m_audioDone = true; emit audioComplete(); }
@@ -675,11 +786,32 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
         return;
     }
 
-    const FragSample &sample = track.fragSamples[idx];
+    // Grow the batch by adding consecutive samples as long as each next
+    // sample's offsetInSource picks up exactly where the previous one's
+    // data ends (i.e. there's no gap to skip over with a second Range
+    // request) and the total stays under FRAG_BODY_BATCH_BYTES. This is
+    // the normal case both within a fragment and, in practice, across
+    // fragment boundaries too, since fragments' mdat payloads are laid
+    // out back-to-back in the source.
+    const std::vector<FragSample> &samples = track.fragSamples;
+    size_t endIdx = idx + 1;
+    qint64 batchBytes = qint64(samples[idx].size);
+    while (endIdx < samples.size()) {
+        const FragSample &prev = samples[endIdx - 1];
+        const FragSample &next = samples[endIdx];
+        bool contiguous = (prev.offsetInSource + prev.size) == next.offsetInSource;
+        if (!contiguous || batchBytes + qint64(next.size) > FRAG_BODY_BATCH_BYTES) {
+            break;
+        }
+        batchBytes += qint64(next.size);
+        endIdx++;
+    }
+    batchCount = endIdx - idx;
+
     QString url = isVideoTrack ? m_videoUrl : m_audioUrl;
     QNetworkRequest req(QUrl::fromEncoded(url.toUtf8()));
-    qint64 rangeStart = qint64(sample.offsetInSource);
-    qint64 rangeEnd = rangeStart + qint64(sample.size) - 1;
+    qint64 rangeStart = qint64(samples[idx].offsetInSource);
+    qint64 rangeEnd = rangeStart + batchBytes - 1;
     req.setRawHeader("Range",
             "bytes=" + QByteArray::number(rangeStart) + "-" + QByteArray::number(rangeEnd));
 
@@ -708,22 +840,33 @@ void StreamingRemuxSession::onVideoFragBodyFinished()
     QByteArray body = reply->readAll();
     reply->deleteLater();
 
-    const FragSample &sample = m_videoHead.fragSamples[m_videoFragBodyIndex];
-    if (quint64(body.size()) != sample.size) {
-        failWith(QString("video sample %1 size mismatch: expected %2, got %3 -- server may "
-                "not have honored the Range request").arg(m_videoFragBodyIndex).arg(
-                sample.size).arg(body.size()));
+    // Expected total for every sample in this batch, verified before any
+    // of it is written -- catches a server/proxy returning a
+    // wrong-but-plausible body up front rather than after partially
+    // writing (and rather than only checking the LAST sample's size, as
+    // the un-batched version effectively did, which could miss a body
+    // that's merely misaligned internally but happens to end at the
+    // right total length).
+    quint64 expectedBytes = 0;
+    for (size_t i = 0; i < m_videoFragBodyBatchCount; i++) {
+        expectedBytes += m_videoHead.fragSamples[m_videoFragBodyIndex + i].size;
+    }
+    if (quint64(body.size()) != expectedBytes) {
+        failWith(QString("video sample batch at %1 (%2 samples) size mismatch: expected %3, "
+                "got %4 -- server may not have honored the Range request").arg(
+                m_videoFragBodyIndex).arg(m_videoFragBodyBatchCount).arg(expectedBytes).arg(
+                body.size()));
         return;
     }
 
-    // Output position for this sample: videoOutputOffset (start of this
+    // Output position for this batch: videoOutputOffset (start of this
     // track's span in the output file) plus the running total of all
     // prior video samples' sizes, tracked incrementally to keep each
     // write O(1) rather than re-summing every prior sample.
     qint64 outOffset = qint64(m_plan.videoOutputOffset) + m_videoFragBodyOffsetSoFar;
 
     if (!m_outputFile->seek(outOffset) || m_outputFile->write(body) != body.size()) {
-        failWith("failed writing video sample to output file");
+        failWith("failed writing video sample batch to output file");
         return;
     }
 
@@ -731,7 +874,7 @@ void StreamingRemuxSession::onVideoFragBodyFinished()
     m_videoBytesWritten += body.size();
     emit progress(m_videoBytesWritten, qint64(m_plan.videoBodySize));
 
-    m_videoFragBodyIndex++;
+    m_videoFragBodyIndex += m_videoFragBodyBatchCount;
     requestNextFragBody(true);
 }
 
@@ -750,23 +893,27 @@ void StreamingRemuxSession::onAudioFragBodyFinished()
     QByteArray body = reply->readAll();
     reply->deleteLater();
 
-    const FragSample &sample = m_audioHead.fragSamples[m_audioFragBodyIndex];
-    if (quint64(body.size()) != sample.size) {
-        failWith(QString("audio sample %1 size mismatch: expected %2, got %3 -- server may "
-                "not have honored the Range request").arg(m_audioFragBodyIndex).arg(
-                sample.size).arg(body.size()));
+    quint64 expectedBytes = 0;
+    for (size_t i = 0; i < m_audioFragBodyBatchCount; i++) {
+        expectedBytes += m_audioHead.fragSamples[m_audioFragBodyIndex + i].size;
+    }
+    if (quint64(body.size()) != expectedBytes) {
+        failWith(QString("audio sample batch at %1 (%2 samples) size mismatch: expected %3, "
+                "got %4 -- server may not have honored the Range request").arg(
+                m_audioFragBodyIndex).arg(m_audioFragBodyBatchCount).arg(expectedBytes).arg(
+                body.size()));
         return;
     }
 
     qint64 outOffset = qint64(m_plan.audioOutputOffset) + m_audioFragBodyOffsetSoFar;
 
     if (!m_outputFile->seek(outOffset) || m_outputFile->write(body) != body.size()) {
-        failWith("failed writing audio sample to output file");
+        failWith("failed writing audio sample batch to output file");
         return;
     }
 
     m_audioFragBodyOffsetSoFar += body.size();
-    m_audioFragBodyIndex++;
+    m_audioFragBodyIndex += m_audioFragBodyBatchCount;
     requestNextFragBody(false);
 }
 
