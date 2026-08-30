@@ -35,6 +35,21 @@
 //   // once headReady() fires, session->outputPath() is a valid, playable
 //   // (if still-growing) local MP4 file.
 //
+// One contiguous Range request's worth of video-body samples, computed
+// once up front (in dispatch order) so each batch's absolute output
+// offset is known regardless of which order its request actually
+// completes in -- this is what lets several be downloaded at once
+// instead of strictly one-at-a-time. See FRAG_BODY_CONCURRENCY in the
+// .cpp.
+struct FragBodyBatch
+{
+    size_t startIdx; // index into TrackHead::fragSamples of this batch's first sample
+    size_t count; // number of samples covered
+    qint64 rangeStart; // source byte offset (Range request start)
+    qint64 batchBytes; // total bytes covered (Range request length)
+    qint64 outOffset; // absolute offset in the output file to write this batch's bytes
+};
+
 // C++03/GNU++98 only (matches bbtube's QNX/gcc 4.6.3 toolchain).
 class StreamingRemuxSession: public QObject
 {
@@ -91,7 +106,10 @@ private slots:
     void onVideoMoofFinished();
     void onAudioMoofFinished();
     // Fragment-by-fragment body streaming path (fragmented sources only).
-    void onVideoFragBodyFinished();
+    // Video runs FRAG_BODY_CONCURRENCY batches at once (see
+    // dispatchVideoBodyBatches()); audio stays single-request since it's
+    // small and finishes quickly regardless.
+    void onVideoBodyBatchFinished();
     void onAudioFragBodyFinished();
 
 private:
@@ -110,7 +128,9 @@ private:
 
     // Fragment-by-fragment body streaming helpers (fragmented sources only).
     void beginFragmentedBodyDownloads();
-    void requestNextFragBody(bool isVideoTrack);
+    void requestNextFragBody(bool isVideoTrack); // audio only now -- see class-level comment above onVideoBodyBatchFinished()
+    void buildVideoBodyBatches(); // computes m_videoBodyBatches once, up front
+    void dispatchVideoBodyBatches(); // fills the FRAG_BODY_CONCURRENCY window
 
     QNetworkAccessManager *m_networkManager;
     QString m_videoUrl;
@@ -194,13 +214,18 @@ private:
     // into a single Range request up to FRAG_BODY_BATCH_BYTES, and the
     // Finished handler splits that one response back into per-sample
     // writes using m_video/audioFragBodyBatchCount.
-    size_t m_videoFragBodyIndex;
+    // Video: batched + concurrent (see FragBodyBatch above and
+    // FRAG_BODY_CONCURRENCY in the .cpp).
+    std::vector<FragBodyBatch> m_videoBodyBatches;
+    size_t m_videoBodyDispatchIndex; // next batch index still needing a request DISPATCHED
+    size_t m_videoBodyCompletedCount; // how many batches have finished (any order)
+    QList<QNetworkReply *> m_videoBodyReplies; // in-flight, order not significant
+
+    // Audio: still single-request-at-a-time -- small enough that the
+    // extra plumbing for concurrency isn't worth it.
     size_t m_audioFragBodyIndex;
-    size_t m_videoFragBodyBatchCount; // number of samples covered by the in-flight request
     size_t m_audioFragBodyBatchCount;
-    qint64 m_videoFragBodyOffsetSoFar;
     qint64 m_audioFragBodyOffsetSoFar;
-    QNetworkReply *m_videoFragBodyReply;
     QNetworkReply *m_audioFragBodyReply;
 };
 

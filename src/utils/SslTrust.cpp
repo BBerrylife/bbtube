@@ -76,20 +76,32 @@ void SslTrust::installExtraRootCertificates()
              << isrgRootX1.subjectInfo(QSslCertificate::CommonName)
              << "expires:" << isrgRootX1.expiryDate().toString();
 
-    // IMPORTANT: use the ADDITIVE API (QSslSocket::addDefaultCaCertificates),
-    // not a read-caCertificates-then-setCaCertificates round trip via
-    // QSslConfiguration::defaultConfiguration(). On this BB10/Qt4 build,
-    // QSslConfiguration::defaultConfiguration().caCertificates() returns
-    // an EMPTY list (confirmed via logging -- BB10 apparently doesn't
-    // populate the OS-trusted CA list into that particular accessor), so
-    // an earlier version of this function that did
-    // config.setCaCertificates(config.caCertificates() << isrgRootX1)
-    // silently replaced the entire trusted CA set with just this one
-    // certificate, breaking every other HTTPS host the app talks to.
-    // addDefaultCaCertificates() instead appends to whatever the
-    // platform's real default set is, without needing to read/know that
-    // set ourselves.
-    QList<QSslCertificate> toAdd;
+    // IMPORTANT: QSslSocket::defaultCaCertificates() (the store actually
+    // used to verify handshakes) is NOT pre-populated with the OS trust
+    // store on this BB10/Qt4 build -- confirmed via logging, it starts
+    // EMPTY. QSslSocket::systemCaCertificates() (queried above into
+    // systemCerts) DOES return the 125 OS-trusted roots, but that's a
+    // separate, read-only snapshot that nothing wires into the verification
+    // path automatically.
+    //
+    // A previous version of this function called
+    // addDefaultCaCertificates() with only the embedded ISRG Root X1 cert,
+    // assuming it would be appended to an already-populated OS store.
+    // Because the real store was empty, that left exactly ONE trusted CA
+    // in the whole app (confirmed via logging: "default CA certificates
+    // after install: 1"). That broke TLS to every HTTPS host whose chain
+    // doesn't lead to Let's Encrypt -- notably *.googlevideo.com, which
+    // chains through Google/GTS or DigiCert roots, not ISRG Root X1. Direct
+    // video stream fetches (HEAD/GET against googlevideo.com, used by the
+    // remuxer regardless of requested resolution) then failed SSL
+    // handshake, while plain-HTTP calls like the Invidious instance
+    // requests kept working since they never touch TLS at all.
+    //
+    // Fix: explicitly seed the default store with the full system CA list
+    // *plus* the embedded ISRG Root X1 (kept in case the system store is
+    // missing/outdated on some devices), rather than relying on any
+    // implicit merge.
+    QList<QSslCertificate> toAdd = systemCerts;
     toAdd.append(isrgRootX1);
     QSslSocket::addDefaultCaCertificates(toAdd);
 

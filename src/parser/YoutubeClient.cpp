@@ -6,6 +6,7 @@
 #include "src/parser/models/TrendingData.hpp"
 
 #include "src/applicationui.hpp"
+#include "src/auth/GoogleAuthManager.hpp"
 #include "src/parser/script/ScriptData.hpp"
 #include "src/parser/script/ScriptParser.hpp"
 #include "src/parser/cipher/DecryptHelper.hpp"
@@ -23,8 +24,11 @@
 #include <QtNetwork/QNetworkCookie>
 #include <QtNetwork/QNetworkCookieJar>
 #include <QtCore/QDate>
+#include <QtCore/QDateTime>
 #include <QDebug>
 #include <bb/data/JsonDataAccess>
+
+#include <openssl/sha.h>
 
 QMap<QString, ScriptData> YoutubeClient::cachedScripts;
 
@@ -193,6 +197,51 @@ void YoutubeClient::parse(QString videoId)
     QObject::connect(watchReply, SIGNAL(finished()), this, SLOT(onGetHtmlFinished()));
 }
 
+// Computes the "Authorization: SAPISIDHASH ..." value Google's endpoints
+// accept as proof of a signed-in session, given the raw SAPISID (or
+// __Secure-3PAPISID) cookie value and the Origin the request claims to
+// come from. Algorithm (unchanged since Google introduced it, used
+// identically by yt-dlp's cookie-auth path and by youtube.com's own web
+// client): SHA1("<unix-timestamp> <sapisid> <origin>"), hex-encoded, sent
+// as "<unix-timestamp>_<hex-digest>".
+//
+// NOTE ON SCOPE: SAPISIDHASH is fundamentally a proof that the request
+// carries a valid *browser* session (it's derived from a cookie only a
+// signed-in browser has) -- it's not tied to any particular declared
+// InnerTube "clientName" in the JSON body. Attaching it (+ the Cookie
+// header) to the tv/android_vr/android /player calls below is
+// low-risk -- if YouTube's server doesn't honor cookie auth for a given
+// declared client, it simply ignores the header and behaves exactly as
+// it did before this change (anonymous). It is NOT the same as full
+// WEB-client OAuth/session emulation, and does not touch signature
+// cipher solving (still unimplemented for the current WEB client's
+// obfuscated player.js, which is a much larger undertaking involving a
+// JS engine -- see yt-dlp's own struggles with this as of 2026).
+static QString computeSapisidHash(const QString &sapisid, const QString &origin)
+{
+    qint64 timestamp = QDateTime::currentDateTime().toTime_t();
+    QString toHash = QString("%1 %2 %3").arg(timestamp).arg(sapisid, origin);
+    QByteArray toHashUtf8 = toHash.toUtf8();
+
+    unsigned char digest[SHA_DIGEST_LENGTH]; // 20 bytes
+    SHA1(reinterpret_cast<const unsigned char*>(toHashUtf8.constData()), toHashUtf8.size(), digest);
+
+    QString hex;
+    hex.reserve(SHA_DIGEST_LENGTH * 2);
+    static const char hexChars[] = "0123456789abcdef";
+    for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+        hex.append(hexChars[(digest[i] >> 4) & 0xF]);
+        hex.append(hexChars[digest[i] & 0xF]);
+    }
+
+    return QString("%1_%2").arg(timestamp).arg(hex);
+}
+
+// Origin used both in the SAPISIDHASH computation above and in the
+// "Origin"/"X-Origin" headers below -- these three must all agree for
+// Google's server-side check to accept the hash.
+static const QString INNERTUBE_AUTH_ORIGIN = "https://www.youtube.com";
+
 // Issues the /player POST for a given client (see INNERTUBE_PLAYER_CLIENTS).
 // The reply is tagged with "videoId" and "clientIndex" so onPlayerApiFinished()
 // knows what it's looking at and which client to try next on failure.
@@ -208,6 +257,24 @@ QNetworkReply* YoutubeClient::requestPlayerData(const QString &videoId, int clie
     request.setRawHeader("User-Agent", QByteArray(cfg.userAgent));
     request.setRawHeader("X-YouTube-Client-Name", QByteArray(cfg.clientNameId));
     request.setRawHeader("X-YouTube-Client-Version", QByteArray(cfg.clientVersion));
+
+    // If the user is signed in (Settings -> Google account), attach that
+    // session so this /player call is authenticated instead of anonymous.
+    // See computeSapisidHash()'s comment above for why this is attempted
+    // on every client in the fallback list rather than requiring a
+    // dedicated WEB client entry. Both cookieHeader() and sapisid() return
+    // "" if not logged in or if decrypting the stored session failed, in
+    // which case this whole block is a no-op and the request goes out
+    // exactly as it did before (anonymous).
+    QString cookieHeader = ApplicationUI::googleAuthManager->cookieHeader();
+    QString sapisid = ApplicationUI::googleAuthManager->sapisid();
+    if (!cookieHeader.isEmpty() && !sapisid.isEmpty()) {
+        request.setRawHeader("Cookie", cookieHeader.toUtf8());
+        request.setRawHeader("Authorization",
+                ("SAPISIDHASH " + computeSapisidHash(sapisid, INNERTUBE_AUTH_ORIGIN)).toUtf8());
+        request.setRawHeader("Origin", INNERTUBE_AUTH_ORIGIN.toUtf8());
+        request.setRawHeader("X-Origin", INNERTUBE_AUTH_ORIGIN.toUtf8());
+    }
 
     // "params":"8AEB" (a fixed, unexplained magic value from the original
     // implementation) is intentionally NOT sent — cross-checked against

@@ -7,6 +7,7 @@
 #include <QVariant>
 #include <QVariantList>
 #include <QVariantMap>
+#include <QSet>
 #include <QDebug>
 #include <QtNetwork/QSslCertificate>
 #include <QTimer>
@@ -466,6 +467,21 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &
     int videoCandidatesAdded = 0;
     bool hasUsableAudio = !bestAudioUrl.isEmpty();
 
+    // Quality labels already covered by a progressive (formatStreams)
+    // instance added above -- YouTube commonly exposes the same
+    // resolution (e.g. "360p") both as a progressive itag 18 stream AND
+    // as a video-only adaptiveFormats entry (e.g. itag 134) meant to be
+    // paired with separate audio. Without this check both get appended
+    // to outStorageData->instances and the quality picker shows "360p"
+    // twice -- functionally harmless (both play) but confusing, and
+    // wasteful since the progressive stream is strictly simpler (no
+    // remux needed). Skip the adaptive duplicate; the progressive
+    // instance already covers that quality.
+    QSet<QString> existingQualityLabels;
+    for (int i = 0; i < outStorageData->instances.count(); i++) {
+        existingQualityLabels.insert(outStorageData->instances[i].quality);
+    }
+
     for (int i = 0; i < adaptiveFormats.count(); i++) {
         QVariantMap fmt = adaptiveFormats[i].toMap();
         QString url = fmt["url"].toString();
@@ -492,6 +508,9 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &
         if (qualityLabel.isEmpty()) {
             continue;
         }
+        if (existingQualityLabels.contains(qualityLabel)) {
+            continue; // already covered by a progressive instance -- see comment above
+        }
 
         // Cap at 720p: 1080p (itag 137/299, 30fps or 60fps) has proven
         // unreliable on-device -- the remux plus mmrenderer playback of a
@@ -515,6 +534,7 @@ void InvidiousClient::mapToStorageData(const QVariantMap &videoMap, const QUrl &
         instance.contentLength = fmt["clen"].toString().toULongLong();
         instance.duration = durationMs;
         outStorageData->instances.append(instance);
+        existingQualityLabels.insert(qualityLabel);
         videoCandidatesAdded++;
     }
 

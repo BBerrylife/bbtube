@@ -50,6 +50,27 @@ static const int MOOF_MAX_RETRIES = 3;
 // RAM while still cutting a 44k-sample video down to a few hundred
 // requests instead of 44k.
 static const qint64 FRAG_BODY_BATCH_BYTES = 4 * 1024 * 1024;
+// How many video body batch requests run concurrently. Discovery already
+// uses concurrency (MOOF_DISCOVERY_CONCURRENCY) since it's cheap
+// (8KB/request); this is the same idea applied to the much larger actual
+// sample data, since a single sequential connection's effective
+// throughput over a slow relay can fall behind real-time playback speed
+// on longer/higher-bitrate videos and stall it. Audio stays
+// single-request -- it's small enough that concurrency there wouldn't
+// meaningfully change total download time.
+// Dialed back from 4 -> 2 after reports of playback failing a few
+// seconds in on large videos even though every batch passed its
+// byte-count check. Hypothesis: some community Invidious relays don't
+// cleanly isolate multiple simultaneous Range requests from the same
+// client/connection pool, so a batch can come back the right SIZE but
+// with wrong/mixed CONTENT -- which this code has no way to detect (no
+// checksum, just a length check). 2 concurrent requests still gives a
+// real throughput win over the old fully-sequential approach while
+// being less likely to trip that kind of relay-side bug than 4 was. If
+// large videos still stall/fail partway through at 2, try 1 (fully
+// serial, matching pre-concurrency behavior) to confirm whether this
+// really is the cause before looking elsewhere.
+static const int FRAG_BODY_CONCURRENCY = 2;
 
 static Mp4RemuxBytes qByteArrayToBytes(const QByteArray &arr)
 {
@@ -67,10 +88,9 @@ StreamingRemuxSession::StreamingRemuxSession(QNetworkAccessManager *networkManag
                 0), m_audioHeadReply(0), m_videoBodyReply(0), m_audioBodyReply(0), m_outputFile(0), m_videoBytesWritten(
                 0), m_audioDone(false), m_videoDone(false), m_videoFragmentsReady(false), m_audioFragmentsReady(
                 false), m_videoFragDiscoveryIndex(0), m_audioFragDiscoveryIndex(0), m_videoFragDiscoveryCompleted(
-                0), m_audioFragDiscoveryCompleted(0), m_videoFragBodyIndex(
-                0), m_audioFragBodyIndex(0), m_videoFragBodyBatchCount(
-                0), m_audioFragBodyBatchCount(0), m_videoFragBodyOffsetSoFar(0), m_audioFragBodyOffsetSoFar(
-                0), m_videoFragBodyReply(0), m_audioFragBodyReply(0)
+                0), m_audioFragDiscoveryCompleted(0), m_videoBodyDispatchIndex(
+                0), m_videoBodyCompletedCount(0), m_audioFragBodyIndex(
+                0), m_audioFragBodyBatchCount(0), m_audioFragBodyOffsetSoFar(0), m_audioFragBodyReply(0)
 {
 }
 
@@ -88,7 +108,10 @@ StreamingRemuxSession::~StreamingRemuxSession()
         m_audioMoofReplies[i]->abort();
         m_audioMoofReplies[i]->deleteLater();
     }
-    if (m_videoFragBodyReply) { m_videoFragBodyReply->abort(); m_videoFragBodyReply->deleteLater(); }
+    for (int i = 0; i < m_videoBodyReplies.size(); i++) {
+        m_videoBodyReplies[i]->abort();
+        m_videoBodyReplies[i]->deleteLater();
+    }
     if (m_audioFragBodyReply) { m_audioFragBodyReply->abort(); m_audioFragBodyReply->deleteLater(); }
     if (m_outputFile) {
         m_outputFile->close();
@@ -128,7 +151,11 @@ void StreamingRemuxSession::cancel()
         m_audioMoofReplies[i]->deleteLater();
     }
     m_audioMoofReplies.clear();
-    if (m_videoFragBodyReply) { m_videoFragBodyReply->abort(); m_videoFragBodyReply->deleteLater(); m_videoFragBodyReply = 0; }
+    for (int i = 0; i < m_videoBodyReplies.size(); i++) {
+        m_videoBodyReplies[i]->abort();
+        m_videoBodyReplies[i]->deleteLater();
+    }
+    m_videoBodyReplies.clear();
     if (m_audioFragBodyReply) { m_audioFragBodyReply->abort(); m_audioFragBodyReply->deleteLater(); m_audioFragBodyReply = 0; }
     if (m_outputFile) {
         m_outputFile->close();
@@ -764,24 +791,32 @@ void StreamingRemuxSession::beginFragmentedBodyDownloads()
         return;
     }
 
-    m_videoFragBodyIndex = 0;
     m_audioFragBodyIndex = 0;
-    m_videoFragBodyBatchCount = 0;
     m_audioFragBodyBatchCount = 0;
-    m_videoFragBodyOffsetSoFar = 0;
     m_audioFragBodyOffsetSoFar = 0;
-    requestNextFragBody(true);
+    buildVideoBodyBatches();
+    if (m_videoBodyBatches.empty()) {
+        // No video samples at all (shouldn't normally happen, but don't
+        // hang waiting for a completion that can never come).
+        m_videoDone = true;
+        checkAllDone();
+    } else {
+        dispatchVideoBodyBatches();
+    }
     requestNextFragBody(false);
 }
 
+// Audio only now (see class-level comment on onVideoBodyBatchFinished()
+// for why video moved to a separate, concurrent path). Kept as a single
+// sequential request-then-next-request cursor since audio is small
+// enough that it isn't worth the extra batch-list plumbing.
 void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
 {
-    TrackHead &track = isVideoTrack ? m_videoHead : m_audioHead;
-    size_t &idx = isVideoTrack ? m_videoFragBodyIndex : m_audioFragBodyIndex;
-    size_t &batchCount = isVideoTrack ? m_videoFragBodyBatchCount : m_audioFragBodyBatchCount;
+    (void)isVideoTrack; // always false now; kept in the signature to match the .hpp/dispatchMoofRequests style
 
-    if (idx >= track.fragSamples.size()) {
-        if (isVideoTrack) { m_videoDone = true; } else { m_audioDone = true; emit audioComplete(); }
+    if (m_audioFragBodyIndex >= m_audioHead.fragSamples.size()) {
+        m_audioDone = true;
+        emit audioComplete();
         checkAllDone();
         return;
     }
@@ -789,11 +824,9 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
     // Grow the batch by adding consecutive samples as long as each next
     // sample's offsetInSource picks up exactly where the previous one's
     // data ends (i.e. there's no gap to skip over with a second Range
-    // request) and the total stays under FRAG_BODY_BATCH_BYTES. This is
-    // the normal case both within a fragment and, in practice, across
-    // fragment boundaries too, since fragments' mdat payloads are laid
-    // out back-to-back in the source.
-    const std::vector<FragSample> &samples = track.fragSamples;
+    // request) and the total stays under FRAG_BODY_BATCH_BYTES.
+    const std::vector<FragSample> &samples = m_audioHead.fragSamples;
+    size_t idx = m_audioFragBodyIndex;
     size_t endIdx = idx + 1;
     qint64 batchBytes = qint64(samples[idx].size);
     while (endIdx < samples.size()) {
@@ -806,76 +839,146 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
         batchBytes += qint64(next.size);
         endIdx++;
     }
-    batchCount = endIdx - idx;
+    m_audioFragBodyBatchCount = endIdx - idx;
 
-    QString url = isVideoTrack ? m_videoUrl : m_audioUrl;
-    QNetworkRequest req(QUrl::fromEncoded(url.toUtf8()));
+    QNetworkRequest req(QUrl::fromEncoded(m_audioUrl.toUtf8()));
     qint64 rangeStart = qint64(samples[idx].offsetInSource);
     qint64 rangeEnd = rangeStart + batchBytes - 1;
     req.setRawHeader("Range",
             "bytes=" + QByteArray::number(rangeStart) + "-" + QByteArray::number(rangeEnd));
 
     QNetworkReply *reply = m_networkManager->get(req);
-    if (isVideoTrack) {
-        m_videoFragBodyReply = reply;
-        QObject::connect(reply, SIGNAL(finished()), this, SLOT(onVideoFragBodyFinished()));
-    } else {
-        m_audioFragBodyReply = reply;
-        QObject::connect(reply, SIGNAL(finished()), this, SLOT(onAudioFragBodyFinished()));
+    m_audioFragBodyReply = reply;
+    QObject::connect(reply, SIGNAL(finished()), this, SLOT(onAudioFragBodyFinished()));
+}
+
+// Splits the video track's samples into a fixed list of contiguous-range
+// batches, computed once up front so every batch's absolute output
+// offset is known in advance -- see buildVideoBodyBatches()'s use of a
+// running prefix-sum below. That's what makes it safe to have several
+// batches' requests in flight (and completing) in any order, unlike the
+// old single-cursor approach where the next request could only be formed
+// once the previous one's byte count was known.
+void StreamingRemuxSession::buildVideoBodyBatches()
+{
+    m_videoBodyBatches.clear();
+    m_videoBodyDispatchIndex = 0;
+    m_videoBodyCompletedCount = 0;
+
+    const std::vector<FragSample> &samples = m_videoHead.fragSamples;
+    qint64 outOffsetCursor = qint64(m_plan.videoOutputOffset);
+    size_t idx = 0;
+    while (idx < samples.size()) {
+        // Grow the batch by adding consecutive samples as long as each
+        // next sample's offsetInSource picks up exactly where the
+        // previous one's data ends (i.e. there's no gap to skip over
+        // with a second Range request) and the total stays under
+        // FRAG_BODY_BATCH_BYTES. This is the normal case both within a
+        // fragment and, in practice, across fragment boundaries too,
+        // since fragments' mdat payloads are laid out back-to-back in
+        // the source.
+        size_t endIdx = idx + 1;
+        qint64 batchBytes = qint64(samples[idx].size);
+        while (endIdx < samples.size()) {
+            const FragSample &prev = samples[endIdx - 1];
+            const FragSample &next = samples[endIdx];
+            bool contiguous = (prev.offsetInSource + prev.size) == next.offsetInSource;
+            if (!contiguous || batchBytes + qint64(next.size) > FRAG_BODY_BATCH_BYTES) {
+                break;
+            }
+            batchBytes += qint64(next.size);
+            endIdx++;
+        }
+
+        FragBodyBatch batch;
+        batch.startIdx = idx;
+        batch.count = endIdx - idx;
+        batch.rangeStart = qint64(samples[idx].offsetInSource);
+        batch.batchBytes = batchBytes;
+        batch.outOffset = outOffsetCursor;
+        m_videoBodyBatches.push_back(batch);
+
+        outOffsetCursor += batchBytes;
+        idx = endIdx;
     }
 }
 
-void StreamingRemuxSession::onVideoFragBodyFinished()
+// Keeps up to FRAG_BODY_CONCURRENCY video body batch requests in flight
+// at once. Called both to kick off the initial window and again after
+// each completion to keep it full until every batch has been dispatched.
+// Running several batches at once (instead of the previous strictly
+// one-at-a-time approach) matters for longer/higher-bitrate videos: over
+// a slow relay, a single sequential connection's effective throughput
+// can fall behind real-time playback speed and stall it, even though the
+// relay has spare capacity for more parallel connections.
+void StreamingRemuxSession::dispatchVideoBodyBatches()
+{
+    while (m_videoBodyReplies.size() < FRAG_BODY_CONCURRENCY
+            && m_videoBodyDispatchIndex < m_videoBodyBatches.size()) {
+        const FragBodyBatch &batch = m_videoBodyBatches[m_videoBodyDispatchIndex];
+
+        QNetworkRequest req(QUrl::fromEncoded(m_videoUrl.toUtf8()));
+        qint64 rangeEnd = batch.rangeStart + batch.batchBytes - 1;
+        req.setRawHeader("Range",
+                "bytes=" + QByteArray::number(batch.rangeStart) + "-"
+                        + QByteArray::number(rangeEnd));
+
+        QNetworkReply *reply = m_networkManager->get(req);
+        // Batch index travels with the reply itself, since completions
+        // can arrive out of dispatch order once several are in flight.
+        reply->setProperty("batchIndex", qint64(m_videoBodyDispatchIndex));
+        m_videoBodyReplies.append(reply);
+        QObject::connect(reply, SIGNAL(finished()), this, SLOT(onVideoBodyBatchFinished()));
+
+        m_videoBodyDispatchIndex++;
+    }
+}
+
+void StreamingRemuxSession::onVideoBodyBatchFinished()
 {
     if (m_failed) return;
-    QNetworkReply *reply = m_videoFragBodyReply;
-    m_videoFragBodyReply = 0;
+    QNetworkReply *reply = qobject_cast<QNetworkReply *>(QObject::sender());
+    m_videoBodyReplies.removeOne(reply);
+    qint64 batchIndex = reply->property("batchIndex").toLongLong();
+    const FragBodyBatch &batch = m_videoBodyBatches[size_t(batchIndex)];
 
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith("video fragment sample download failed: " + msg);
+        failWith(QString("video sample batch %1 download failed: %2").arg(batchIndex).arg(msg));
         return;
     }
     QByteArray body = reply->readAll();
     reply->deleteLater();
 
-    // Expected total for every sample in this batch, verified before any
-    // of it is written -- catches a server/proxy returning a
-    // wrong-but-plausible body up front rather than after partially
-    // writing (and rather than only checking the LAST sample's size, as
-    // the un-batched version effectively did, which could miss a body
-    // that's merely misaligned internally but happens to end at the
-    // right total length).
-    quint64 expectedBytes = 0;
-    for (size_t i = 0; i < m_videoFragBodyBatchCount; i++) {
-        expectedBytes += m_videoHead.fragSamples[m_videoFragBodyIndex + i].size;
-    }
-    if (quint64(body.size()) != expectedBytes) {
-        failWith(QString("video sample batch at %1 (%2 samples) size mismatch: expected %3, "
-                "got %4 -- server may not have honored the Range request").arg(
-                m_videoFragBodyIndex).arg(m_videoFragBodyBatchCount).arg(expectedBytes).arg(
-                body.size()));
+    // Verified before any of it is written -- catches a server/proxy
+    // returning a wrong-but-plausible body up front rather than after
+    // partially writing.
+    if (qint64(body.size()) != batch.batchBytes) {
+        failWith(QString("video sample batch %1 (%2 samples) size mismatch: expected %3, "
+                "got %4 -- server may not have honored the Range request").arg(batchIndex).arg(
+                qint64(batch.count)).arg(batch.batchBytes).arg(body.size()));
         return;
     }
 
-    // Output position for this batch: videoOutputOffset (start of this
-    // track's span in the output file) plus the running total of all
-    // prior video samples' sizes, tracked incrementally to keep each
-    // write O(1) rather than re-summing every prior sample.
-    qint64 outOffset = qint64(m_plan.videoOutputOffset) + m_videoFragBodyOffsetSoFar;
-
-    if (!m_outputFile->seek(outOffset) || m_outputFile->write(body) != body.size()) {
-        failWith("failed writing video sample batch to output file");
+    // batch.outOffset was computed up front in buildVideoBodyBatches(),
+    // so this write is correct regardless of which order batches finish
+    // in.
+    if (!m_outputFile->seek(batch.outOffset) || m_outputFile->write(body) != body.size()) {
+        failWith(QString("failed writing video sample batch %1 to output file").arg(batchIndex));
         return;
     }
 
-    m_videoFragBodyOffsetSoFar += body.size();
     m_videoBytesWritten += body.size();
     emit progress(m_videoBytesWritten, qint64(m_plan.videoBodySize));
 
-    m_videoFragBodyIndex += m_videoFragBodyBatchCount;
-    requestNextFragBody(true);
+    m_videoBodyCompletedCount++;
+    if (m_videoBodyCompletedCount >= m_videoBodyBatches.size()) {
+        m_videoDone = true;
+        checkAllDone();
+        return;
+    }
+    dispatchVideoBodyBatches();
 }
 
 void StreamingRemuxSession::onAudioFragBodyFinished()
@@ -950,7 +1053,11 @@ void StreamingRemuxSession::failWith(const QString &message)
         m_audioMoofReplies[i]->deleteLater();
     }
     m_audioMoofReplies.clear();
-    if (m_videoFragBodyReply) { m_videoFragBodyReply->abort(); m_videoFragBodyReply->deleteLater(); m_videoFragBodyReply = 0; }
+    for (int i = 0; i < m_videoBodyReplies.size(); i++) {
+        m_videoBodyReplies[i]->abort();
+        m_videoBodyReplies[i]->deleteLater();
+    }
+    m_videoBodyReplies.clear();
     if (m_audioFragBodyReply) { m_audioFragBodyReply->abort(); m_audioFragBodyReply->deleteLater(); m_audioFragBodyReply = 0; }
     if (m_outputFile) { m_outputFile->close(); }
 

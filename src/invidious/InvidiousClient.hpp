@@ -57,7 +57,17 @@ private slots:
     void onFetchTimeout();
 
 private:
-    static const int MAX_INSTANCE_ATTEMPTS = 3;
+    // Bumped from 3 -> 5: with YouTube's SABR rollout increasingly leaving
+    // the direct-InnerTube fallback (YoutubeClient) with only a 360p
+    // progressive stream (no adaptive URLs at all, not even cipher-
+    // encoded ones -- nothing to decrypt), a live Invidious instance is
+    // often the only way to get 480p/720p/1080p at all. The instance list
+    // is refreshed with several candidates (commonly 5-10+), so trying
+    // more of them before giving up meaningfully improves the odds of
+    // hitting one that isn't down/overloaded, at the cost of a few more
+    // seconds of retry time in the worst case (all instances actually
+    // are down).
+    static const int MAX_INSTANCE_ATTEMPTS = 5;
 
     void requestFromInstance(const QString &videoId, const QString &instanceBaseUrl,
             int attemptNumber);

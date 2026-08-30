@@ -800,6 +800,7 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
             storageData.audio.url, outputPath, this);
 
     QObject::connect(remuxSession, SIGNAL(headReady()), this, SLOT(onRemuxHeadReady()));
+    QObject::connect(remuxSession, SIGNAL(audioComplete()), this, SLOT(onRemuxAudioComplete()));
     QObject::connect(remuxSession, SIGNAL(failed(QString)), this, SLOT(onRemuxFailed(QString)));
     QObject::connect(remuxSession, SIGNAL(finished()), this, SLOT(onRemuxFinished()));
 
@@ -808,10 +809,35 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
 
 void PlayerPage::onRemuxHeadReady()
 {
-    // Output file is now valid ISOBMFF at its final size (audio+video
-    // still filling in for the video body). Safe to hand to the player
-    // now -- audio is streamed in first and completes quickly since it's
-    // small, and mmrenderer reads sequentially from the front.
+    // Output file is now valid ISOBMFF at its final size (moov/stco/stsz
+    // etc. written, mdat regions still blank/sparse). NOT safe to hand to
+    // the player yet: headReady() fires before beginBodyDownloads()/
+    // beginFragmentedBodyDownloads() has even been called, so at this
+    // point zero bytes of audio or video body have actually been written.
+    // Playback is kicked off later, from onRemuxAudioComplete(), once the
+    // audio track (which sits at the front of the output file) is fully
+    // on disk -- see that function for why audio-complete rather than
+    // head-ready is the right gate.
+}
+
+void PlayerPage::onRemuxAudioComplete()
+{
+    // Audio track occupies the front of the output file (see
+    // StreamingRemuxSession's layout: audioOutputOffset < videoOutputOffset),
+    // and mmrenderer reads sequentially from the front. Once audio is
+    // fully written, playback can start safely even while the (larger)
+    // video body is still streaming in behind it.
+    //
+    // Previously this was wired to headReady() instead, which fires
+    // immediately after the output file is allocated but BEFORE any body
+    // download has even started -- fine by coincidence on the
+    // non-fragmented beginBodyDownloads() path, where audio is written in
+    // one quick shot right after, but a real race on the fragmented DASH
+    // path (beginFragmentedBodyDownloads()), where audio itself streams in
+    // over several sequential batched Range requests. Over a slow/high-
+    // latency relay, the player could open a file with a completely empty
+    // (sparse-zero) mdat and fail immediately with "source unavailable",
+    // even though the download went on to complete successfully.
     if (pendingRemuxQualityLabel != "") {
         QString newQuality = pendingRemuxQualityLabel;
         pendingRemuxQualityLabel = "";
