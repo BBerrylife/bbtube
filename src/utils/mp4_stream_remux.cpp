@@ -590,6 +590,59 @@ static void shiftChunkOffsets(Mp4RemuxBytes &box, bool is64, int64_t delta) {
         }
     }
 }
+// shiftChunkOffsets() above assumes every sample's gap to the next one in
+// the OUTPUT file is identical to its gap in the SOURCE (it just adds one
+// constant delta to every stco entry), which only holds when the body is
+// written to the output exactly as laid out in the source. That's true for
+// a plain (non-fragmented) track, whose mdat is one contiguous span both
+// before and after remuxing.
+//
+// It's false for a fragmented DASH source: consecutive fragments' mdat
+// payloads are usually back-to-back in the source, but NOT always -- e.g.
+// the byte range between one fetched batch's samples and the next can have
+// a gap (moof/other box bytes, or simply a batch boundary that didn't land
+// on a contiguous run -- see buildVideoBodyBatches()'s "contiguous" check).
+// The body-download path (onVideoBodyBatchFinished()/onAudioFragBodyFinished())
+// writes every sample to the output back-to-back regardless -- no gaps in
+// the output file, ever -- but shiftChunkOffsets() doesn't know that: it
+// preserves whatever gaps existed in the source, so every sample after the
+// first such gap ends up with a wrong (too-large) declared offset in stco,
+// pointing past where its bytes actually are. This was found in the field
+// via ffprobe/ffmpeg analysis of an actual remuxed file: the first 136
+// video samples (before the first inter-batch gap) decoded fine, and every
+// sample after that was corrupt -- matching "plays for ~5 seconds then
+// fails" exactly.
+//
+// Fix: for a fragmented track, rebuild stco from scratch using each
+// sample's actual (gapless) position in the output -- a running prefix sum
+// of fragSamples[i].size, the same math the body-download path itself uses
+// to compute where each sample's bytes really land.
+static void rebuildStcoContiguous(TrackHead &track, uint64_t outputMdatStart) {
+    uint32_t entryCount = uint32_t(track.fragSamples.size());
+    size_t entrySize = track.stcoIs64 ? 8 : 4;
+    size_t entriesStart = 16;
+    if (track.stcoBox.size() < entriesStart + size_t(entryCount) * entrySize) {
+        throw std::runtime_error(track.label + ": stco box too small to hold "
+                + track.label + "'s fragSamples entries");
+    }
+
+    uint64_t cursor = outputMdatStart;
+    for (uint32_t i = 0; i < entryCount; i++) {
+        size_t off = entriesStart + size_t(i) * entrySize;
+        if (track.stcoIs64) {
+            uint64_t v = cursor;
+            track.stcoBox[off+0]=uint8_t(v>>56); track.stcoBox[off+1]=uint8_t(v>>48);
+            track.stcoBox[off+2]=uint8_t(v>>40); track.stcoBox[off+3]=uint8_t(v>>32);
+            track.stcoBox[off+4]=uint8_t(v>>24); track.stcoBox[off+5]=uint8_t(v>>16);
+            track.stcoBox[off+6]=uint8_t(v>>8);  track.stcoBox[off+7]=uint8_t(v);
+        } else {
+            uint32_t v = uint32_t(cursor);
+            track.stcoBox[off+0]=uint8_t(v>>24); track.stcoBox[off+1]=uint8_t(v>>16);
+            track.stcoBox[off+2]=uint8_t(v>>8);  track.stcoBox[off+3]=uint8_t(v);
+        }
+        cursor += track.fragSamples[i].size;
+    }
+}
 static void patchTkhdTrackId(Mp4RemuxBytes &tkhd, uint32_t newId) {
     uint8_t version = tkhd[8];
     size_t idOff = 8 + ((version == 1) ? 20 : 12);
@@ -702,8 +755,23 @@ bool planStreamingRemux(TrackHead &videoHead, TrackHead &audioHead,
                 "videoOutStart=%zu videoHead.mdatBodyOffsetInSource=%zu videoDelta=%lld\n",
                 audioOutStart, audioHead.mdatBodyOffsetInSource, (long long)audioDelta,
                 videoOutStart, videoHead.mdatBodyOffsetInSource, (long long)videoDelta);
-        shiftChunkOffsets(audioHead.stcoBox, audioHead.stcoIs64, audioDelta);
-        shiftChunkOffsets(videoHead.stcoBox, videoHead.stcoIs64, videoDelta);
+        // Fragmented (DASH) tracks: samples can have gaps between them in
+        // the source that the body-download path doesn't preserve in the
+        // output (see rebuildStcoContiguous()'s comment), so stco must be
+        // rebuilt from each sample's actual gapless output position rather
+        // than shifted by a single constant delta. Non-fragmented tracks'
+        // mdat is one contiguous span in both source and output, so the
+        // constant-delta shift remains correct (and cheaper) for them.
+        if (audioHead.isFragmented) {
+            rebuildStcoContiguous(audioHead, uint64_t(audioOutStart));
+        } else {
+            shiftChunkOffsets(audioHead.stcoBox, audioHead.stcoIs64, audioDelta);
+        }
+        if (videoHead.isFragmented) {
+            rebuildStcoContiguous(videoHead, uint64_t(videoOutStart));
+        } else {
+            shiftChunkOffsets(videoHead.stcoBox, videoHead.stcoIs64, videoDelta);
+        }
         {
             uint32_t vEntryCount = videoHead.stcoBox.size() >= 16 ? rd32(&videoHead.stcoBox[12]) : 0;
             uint32_t aEntryCount = audioHead.stcoBox.size() >= 16 ? rd32(&audioHead.stcoBox[12]) : 0;

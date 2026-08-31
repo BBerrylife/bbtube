@@ -314,6 +314,19 @@ void MiniPlayer::onPlaylistButtonClicked()
 
 void MiniPlayer::onMiniPlayerStopped()
 {
+    // stopMiniPlayer() (GlobalPlayerContext) only clears its own internal
+    // windowHandle -- it doesn't (and shouldn't; it has no reference to
+    // this MiniPlayer's UI controls) unbind foreignWindowControl itself.
+    // Left bound, ForeignWindowControl keeps compositing the screen
+    // window's LAST rendered frame even after the underlying window is
+    // gone/stopped -- setVisible(false) hides the control but does not
+    // clear that composited buffer. The next time setVideo() runs for a
+    // DIFFERENT video and re-shows this MiniPlayer, that stale frame from
+    // the previous video would flash briefly before the new window's
+    // first frame arrives. Explicitly unbind so there's nothing stale for
+    // it to show.
+    foreignWindowControl->bindToWindow(0, "", "");
+    foreignWindowControl->setVisible(false);
     this->setVisible(false);
 }
 

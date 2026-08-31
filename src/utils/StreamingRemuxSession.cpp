@@ -42,6 +42,15 @@ static const int MOOF_DISCOVERY_CONCURRENCY = 5;
 // the same videoplayback URL concurrently) are retried this many times
 // before giving up and failing the whole remux session.
 static const int MOOF_MAX_RETRIES = 3;
+// Same idea as MOOF_MAX_RETRIES, but for the actual body (mdat) fetches
+// rather than moof header discovery. Seen in the field on a slow/flaky
+// relay: an audio body batch's Range request came back HTTP 200 with an
+// empty body instead of 206 with the requested bytes ("server may not
+// have honored the Range request"), which previously failed the whole
+// remux session on the very first such hiccup even though every other
+// batch in the same session succeeded. Retry a batch this many times
+// before giving up.
+static const int BODY_MAX_RETRIES = 3;
 // Upper bound, in bytes, for how much a single grouped fragment-body
 // Range request is allowed to cover -- see the comment on
 // m_video/audioFragBodyBatchCount in the header for why samples are
@@ -90,7 +99,8 @@ StreamingRemuxSession::StreamingRemuxSession(QNetworkAccessManager *networkManag
                 false), m_videoFragDiscoveryIndex(0), m_audioFragDiscoveryIndex(0), m_videoFragDiscoveryCompleted(
                 0), m_audioFragDiscoveryCompleted(0), m_videoBodyDispatchIndex(
                 0), m_videoBodyCompletedCount(0), m_audioFragBodyIndex(
-                0), m_audioFragBodyBatchCount(0), m_audioFragBodyOffsetSoFar(0), m_audioFragBodyReply(0)
+                0), m_audioFragBodyBatchCount(0), m_audioFragBodyOffsetSoFar(0), m_audioFragBodyReply(
+                0), m_audioFragBodyRetryCount(0), m_videoHeadRetryCount(0), m_audioHeadRetryCount(0)
 {
 }
 
@@ -195,7 +205,15 @@ void StreamingRemuxSession::onVideoHeadFinished()
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith("video head fetch failed: " + msg);
+        if (m_videoHeadRetryCount < BODY_MAX_RETRIES) {
+            m_videoHeadRetryCount++;
+            qDebug() << "[bbtube][remux] video head fetch failed (" << msg
+                     << ") - retrying, attempt" << m_videoHeadRetryCount << "of" << BODY_MAX_RETRIES;
+            requestVideoHead();
+            return;
+        }
+        failWith(QString("video head fetch failed after %1 retries: %2").arg(BODY_MAX_RETRIES).arg(
+                msg));
         return;
     }
 
@@ -263,7 +281,15 @@ void StreamingRemuxSession::onAudioHeadFinished()
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith("audio head fetch failed: " + msg);
+        if (m_audioHeadRetryCount < BODY_MAX_RETRIES) {
+            m_audioHeadRetryCount++;
+            qDebug() << "[bbtube][remux] audio head fetch failed (" << msg
+                     << ") - retrying, attempt" << m_audioHeadRetryCount << "of" << BODY_MAX_RETRIES;
+            requestAudioHead();
+            return;
+        }
+        failWith(QString("audio head fetch failed after %1 retries: %2").arg(BODY_MAX_RETRIES).arg(
+                msg));
         return;
     }
 
@@ -677,6 +703,10 @@ void StreamingRemuxSession::beginBodyDownloads()
     m_videoBodyReply = m_networkManager->get(videoReq);
     QObject::connect(m_videoBodyReply, SIGNAL(readyRead()), this, SLOT(onVideoBodyReadyRead()));
     QObject::connect(m_videoBodyReply, SIGNAL(finished()), this, SLOT(onVideoBodyFinished()));
+
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux][debug] beginBodyDownloads dispatched audio+video body requests";
+#endif
 }
 
 void StreamingRemuxSession::onAudioBodyFinished()
@@ -684,6 +714,11 @@ void StreamingRemuxSession::onAudioBodyFinished()
     if (m_failed) return;
     QNetworkReply *reply = m_audioBodyReply;
     m_audioBodyReply = 0;
+
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux][debug] onAudioBodyFinished error=" << int(reply->error())
+              << "httpStatus=" << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+#endif
 
     if (reply->error()) {
         QString msg = reply->errorString();
@@ -710,6 +745,17 @@ void StreamingRemuxSession::onAudioBodyFinished()
         failWith("failed writing audio body to output file");
         return;
     }
+
+    // Flush Qt's internal write buffer to the OS before telling anyone
+    // audio is ready to play. mediaPlayer's playback happens in a
+    // separate process (mm-renderer) that opens this same path
+    // independently of our QFile handle -- without an explicit flush,
+    // the just-written audio mdat bytes can still be sitting in QFile's
+    // buffer (not yet handed to the kernel) when mm-renderer opens and
+    // reads the file, which is exactly the kind of race that produces an
+    // immediate attachInput failure or a truncated/garbled first few
+    // seconds of audio.
+    m_outputFile->flush();
 
     m_audioDone = true;
     emit audioComplete();
@@ -791,6 +837,13 @@ void StreamingRemuxSession::beginFragmentedBodyDownloads()
         return;
     }
 
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux][debug] beginFragmentedBodyDownloads output file reopened,"
+             << "starting body downloads -- video samples ="
+             << qint64(m_videoHead.fragSamples.size()) << "audio samples ="
+             << qint64(m_audioHead.fragSamples.size());
+#endif
+
     m_audioFragBodyIndex = 0;
     m_audioFragBodyBatchCount = 0;
     m_audioFragBodyOffsetSoFar = 0;
@@ -847,6 +900,12 @@ void StreamingRemuxSession::requestNextFragBody(bool isVideoTrack)
     req.setRawHeader("Range",
             "bytes=" + QByteArray::number(rangeStart) + "-" + QByteArray::number(rangeEnd));
 
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux][debug] dispatchAudioBodyRequest fragIndex=" << qint64(idx)
+              << "batchCount=" << qint64(m_audioFragBodyBatchCount) << "range=" << rangeStart
+              << "-" << rangeEnd;
+#endif
+
     QNetworkReply *reply = m_networkManager->get(req);
     m_audioFragBodyReply = reply;
     QObject::connect(reply, SIGNAL(finished()), this, SLOT(onAudioFragBodyFinished()));
@@ -901,6 +960,8 @@ void StreamingRemuxSession::buildVideoBodyBatches()
         outOffsetCursor += batchBytes;
         idx = endIdx;
     }
+
+    m_videoBodyRetries.assign(m_videoBodyBatches.size(), 0);
 }
 
 // Keeps up to FRAG_BODY_CONCURRENCY video body batch requests in flight
@@ -923,6 +984,12 @@ void StreamingRemuxSession::dispatchVideoBodyBatches()
                 "bytes=" + QByteArray::number(batch.rangeStart) + "-"
                         + QByteArray::number(rangeEnd));
 
+#ifdef QT_DEBUG
+        qDebug() << "[bbtube][remux][debug] dispatchVideoBodyRequest batchIndex="
+                  << qint64(m_videoBodyDispatchIndex) << "range=" << batch.rangeStart << "-"
+                  << rangeEnd << "inFlight=" << qint64(m_videoBodyReplies.size() + 1);
+#endif
+
         QNetworkReply *reply = m_networkManager->get(req);
         // Batch index travels with the reply itself, since completions
         // can arrive out of dispatch order once several are in flight.
@@ -934,6 +1001,33 @@ void StreamingRemuxSession::dispatchVideoBodyBatches()
     }
 }
 
+// Re-issues the Range request for a single video body batch that just
+// failed (network error or wrong-sized response), without touching
+// m_videoBodyDispatchIndex -- dispatchVideoBodyBatches() only ever moves
+// that cursor forward to reach undispatched batches, so a failed batch's
+// slot would otherwise never be requested again. Wired to the same
+// onVideoBodyBatchFinished() slot as a normal dispatch; that slot's
+// existing retry-count check decides whether a further failure retries
+// again or gives up.
+void StreamingRemuxSession::retryVideoBodyBatch(size_t batchIndex)
+{
+    const FragBodyBatch &batch = m_videoBodyBatches[batchIndex];
+
+    QNetworkRequest req(QUrl::fromEncoded(m_videoUrl.toUtf8()));
+    qint64 rangeEnd = batch.rangeStart + batch.batchBytes - 1;
+    req.setRawHeader("Range",
+            "bytes=" + QByteArray::number(batch.rangeStart) + "-" + QByteArray::number(rangeEnd));
+
+    qDebug() << "[bbtube][remux][debug] retryVideoBodyBatch batchIndex=" << qint64(batchIndex)
+             << "attempt=" << (m_videoBodyRetries[batchIndex] + 1) << "of" << BODY_MAX_RETRIES
+             << "range=" << batch.rangeStart << "-" << rangeEnd;
+
+    QNetworkReply *reply = m_networkManager->get(req);
+    reply->setProperty("batchIndex", qint64(batchIndex));
+    m_videoBodyReplies.append(reply);
+    QObject::connect(reply, SIGNAL(finished()), this, SLOT(onVideoBodyBatchFinished()));
+}
+
 void StreamingRemuxSession::onVideoBodyBatchFinished()
 {
     if (m_failed) return;
@@ -942,10 +1036,26 @@ void StreamingRemuxSession::onVideoBodyBatchFinished()
     qint64 batchIndex = reply->property("batchIndex").toLongLong();
     const FragBodyBatch &batch = m_videoBodyBatches[size_t(batchIndex)];
 
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux][debug] onVideoBodyBatchFinished batchIndex=" << batchIndex
+              << "error=" << int(reply->error()) << "httpStatus="
+              << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+#endif
+
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith(QString("video sample batch %1 download failed: %2").arg(batchIndex).arg(msg));
+        int &retryCount = m_videoBodyRetries[size_t(batchIndex)];
+        if (retryCount < BODY_MAX_RETRIES) {
+            retryCount++;
+            qDebug() << "[bbtube][remux] video sample batch" << batchIndex
+                     << "download failed (" << msg << ") - retrying, attempt" << retryCount
+                     << "of" << BODY_MAX_RETRIES;
+            retryVideoBodyBatch(size_t(batchIndex));
+            return;
+        }
+        failWith(QString("video sample batch %1 download failed after %2 retries: %3").arg(
+                batchIndex).arg(BODY_MAX_RETRIES).arg(msg));
         return;
     }
     QByteArray body = reply->readAll();
@@ -955,9 +1065,20 @@ void StreamingRemuxSession::onVideoBodyBatchFinished()
     // returning a wrong-but-plausible body up front rather than after
     // partially writing.
     if (qint64(body.size()) != batch.batchBytes) {
+        int &retryCount = m_videoBodyRetries[size_t(batchIndex)];
+        if (retryCount < BODY_MAX_RETRIES) {
+            retryCount++;
+            qDebug() << "[bbtube][remux] video sample batch" << batchIndex
+                     << "size mismatch (expected" << batch.batchBytes << "got" << body.size()
+                     << ") - relay may not have honored the Range request, retrying, attempt"
+                     << retryCount << "of" << BODY_MAX_RETRIES;
+            retryVideoBodyBatch(size_t(batchIndex));
+            return;
+        }
         failWith(QString("video sample batch %1 (%2 samples) size mismatch: expected %3, "
-                "got %4 -- server may not have honored the Range request").arg(batchIndex).arg(
-                qint64(batch.count)).arg(batch.batchBytes).arg(body.size()));
+                "got %4 after %5 retries -- server may not have honored the Range request").arg(
+                batchIndex).arg(qint64(batch.count)).arg(batch.batchBytes).arg(body.size()).arg(
+                BODY_MAX_RETRIES));
         return;
     }
 
@@ -987,10 +1108,25 @@ void StreamingRemuxSession::onAudioFragBodyFinished()
     QNetworkReply *reply = m_audioFragBodyReply;
     m_audioFragBodyReply = 0;
 
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux][debug] onAudioFragBodyFinished fragIndex="
+              << qint64(m_audioFragBodyIndex) << "error=" << int(reply->error())
+              << "httpStatus=" << reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+#endif
+
     if (reply->error()) {
         QString msg = reply->errorString();
         reply->deleteLater();
-        failWith("audio fragment sample download failed: " + msg);
+        if (m_audioFragBodyRetryCount < BODY_MAX_RETRIES) {
+            m_audioFragBodyRetryCount++;
+            qDebug() << "[bbtube][remux] audio body batch at" << qint64(m_audioFragBodyIndex)
+                     << "failed (" << msg << ") - retrying, attempt" << m_audioFragBodyRetryCount
+                     << "of" << BODY_MAX_RETRIES;
+            requestNextFragBody(false);
+            return;
+        }
+        failWith(QString("audio fragment sample download failed after %1 retries: %2").arg(
+                BODY_MAX_RETRIES).arg(msg));
         return;
     }
     QByteArray body = reply->readAll();
@@ -1001,12 +1137,26 @@ void StreamingRemuxSession::onAudioFragBodyFinished()
         expectedBytes += m_audioHead.fragSamples[m_audioFragBodyIndex + i].size;
     }
     if (quint64(body.size()) != expectedBytes) {
+        if (m_audioFragBodyRetryCount < BODY_MAX_RETRIES) {
+            m_audioFragBodyRetryCount++;
+            qDebug() << "[bbtube][remux] audio sample batch at" << qint64(m_audioFragBodyIndex)
+                     << "size mismatch (expected" << expectedBytes << "got" << body.size()
+                     << ") - relay may not have honored the Range request, retrying, attempt"
+                     << m_audioFragBodyRetryCount << "of" << BODY_MAX_RETRIES;
+            requestNextFragBody(false);
+            return;
+        }
         failWith(QString("audio sample batch at %1 (%2 samples) size mismatch: expected %3, "
-                "got %4 -- server may not have honored the Range request").arg(
+                "got %4 after %5 retries -- server may not have honored the Range request").arg(
                 m_audioFragBodyIndex).arg(m_audioFragBodyBatchCount).arg(expectedBytes).arg(
-                body.size()));
+                body.size()).arg(BODY_MAX_RETRIES));
         return;
     }
+
+    // This batch succeeded -- reset the counter so a later, different
+    // batch starts its own retry budget from zero rather than inheriting
+    // however many retries this one happened to need.
+    m_audioFragBodyRetryCount = 0;
 
     qint64 outOffset = qint64(m_plan.audioOutputOffset) + m_audioFragBodyOffsetSoFar;
 
@@ -1017,6 +1167,16 @@ void StreamingRemuxSession::onAudioFragBodyFinished()
 
     m_audioFragBodyOffsetSoFar += body.size();
     m_audioFragBodyIndex += m_audioFragBodyBatchCount;
+
+    if (m_audioFragBodyIndex >= m_audioHead.fragSamples.size()) {
+        // Same flush-before-signal requirement as the non-fragmented
+        // audio path above (onAudioBodyFinished) -- see the comment
+        // there. Do it here, right after the last audio batch lands on
+        // disk, rather than relying on requestNextFragBody()'s "no more
+        // samples" branch below to also remember it.
+        m_outputFile->flush();
+    }
+
     requestNextFragBody(false);
 }
 

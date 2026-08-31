@@ -563,11 +563,26 @@ void PlayerPage::onMediaStateChanged(bb::multimedia::MediaState::Type state)
     }
 
     if (state == bb::multimedia::MediaState::Stopped) {
-        if (appSettings->isAutoplay() || playerContext->getPlaylistId() > 0) {
-            onNextActionItemClick();
-        } else {
-            showInfos();
-            progressSlider->setValue(0);
+        // mmrenderer reports the same "Stopped" state both when playback
+        // genuinely reaches the end of the file and when it stops for any
+        // other reason (user pressed pause/the play-pause button, a
+        // transient playback error, etc). Only treat this as "video
+        // finished" -- and therefore auto-advance/replay -- when the
+        // reported position is actually close to the known duration.
+        // Otherwise leave state handling to whoever caused the stop (e.g.
+        // onPlayActionItemClick already updates the button for a user
+        // pause) so a pause/hiccup mid-video doesn't jump to another video.
+        unsigned int positionMs = playerContext->getPosition();
+        bool reachedEnd = !isLiveStream && duration > 0
+                && positionMs >= (unsigned int) (duration * 1000 - 1500);
+
+        if (reachedEnd) {
+            if (appSettings->isAutoplay() || playerContext->getPlaylistId() > 0) {
+                onNextActionItemClick();
+            } else {
+                showInfos();
+                progressSlider->setValue(0);
+            }
         }
     }
 }
@@ -800,7 +815,6 @@ void PlayerPage::startRemuxSession(SingleVideoStorageData videoData)
             storageData.audio.url, outputPath, this);
 
     QObject::connect(remuxSession, SIGNAL(headReady()), this, SLOT(onRemuxHeadReady()));
-    QObject::connect(remuxSession, SIGNAL(audioComplete()), this, SLOT(onRemuxAudioComplete()));
     QObject::connect(remuxSession, SIGNAL(failed(QString)), this, SLOT(onRemuxFailed(QString)));
     QObject::connect(remuxSession, SIGNAL(finished()), this, SLOT(onRemuxFinished()));
 
@@ -814,30 +828,33 @@ void PlayerPage::onRemuxHeadReady()
     // the player yet: headReady() fires before beginBodyDownloads()/
     // beginFragmentedBodyDownloads() has even been called, so at this
     // point zero bytes of audio or video body have actually been written.
-    // Playback is kicked off later, from onRemuxAudioComplete(), once the
-    // audio track (which sits at the front of the output file) is fully
-    // on disk -- see that function for why audio-complete rather than
-    // head-ready is the right gate.
+    // Playback is kicked off later, from onRemuxFinished(), once the
+    // WHOLE file is on disk -- see that function for why.
 }
 
-void PlayerPage::onRemuxAudioComplete()
+void PlayerPage::onRemuxFinished()
 {
-    // Audio track occupies the front of the output file (see
-    // StreamingRemuxSession's layout: audioOutputOffset < videoOutputOffset),
-    // and mmrenderer reads sequentially from the front. Once audio is
-    // fully written, playback can start safely even while the (larger)
-    // video body is still streaming in behind it.
+    // Both tracks fully written to the local output file -- and, per
+    // StreamingRemuxSession::checkAllDone(), the output file handle has
+    // already been close()'d, which guarantees everything is actually on
+    // disk (not just handed to a QFile write buffer). Only NOW is it
+    // safe to open this path in the player.
     //
-    // Previously this was wired to headReady() instead, which fires
-    // immediately after the output file is allocated but BEFORE any body
-    // download has even started -- fine by coincidence on the
-    // non-fragmented beginBodyDownloads() path, where audio is written in
-    // one quick shot right after, but a real race on the fragmented DASH
-    // path (beginFragmentedBodyDownloads()), where audio itself streams in
-    // over several sequential batched Range requests. Over a slow/high-
-    // latency relay, the player could open a file with a completely empty
-    // (sparse-zero) mdat and fail immediately with "source unavailable",
-    // even though the download went on to complete successfully.
+    // This used to be wired to audioComplete() instead, on the theory
+    // that mmrenderer reads a local file sequentially from the front, so
+    // playback could start once audio (which sits before video in the
+    // output layout -- see StreamingRemuxSession's audioOutputOffset <
+    // videoOutputOffset) was fully on disk, even while the much larger
+    // video body was still streaming in behind it. That theory doesn't
+    // hold in practice: mmrenderer's attachInput() appears to need the
+    // whole file (or at least enough of the tail/moov-adjacent structure
+    // that a partially-written video mdat still counts as "not ready")
+    // before it will open a local file at all. Confirmed in the field --
+    // attachInput failed immediately after play(), every time, with the
+    // video body only 60-80% downloaded at that point despite audio
+    // having completed seconds earlier.
+    if (!remuxSession) return;
+
     if (pendingRemuxQualityLabel != "") {
         QString newQuality = pendingRemuxQualityLabel;
         pendingRemuxQualityLabel = "";
@@ -845,6 +862,10 @@ void PlayerPage::onRemuxAudioComplete()
     } else {
         startPlaybackAt(remuxSession->outputPath());
     }
+
+#ifdef QT_DEBUG
+    qDebug() << "[bbtube][remux] finished writing" << remuxSession->outputPath();
+#endif
 }
 
 void PlayerPage::onRemuxFailed(QString errorMessage)
@@ -856,18 +877,6 @@ void PlayerPage::onRemuxFailed(QString errorMessage)
         remuxSession = 0;
     }
     pendingRemuxQualityLabel = "";
-}
-
-void PlayerPage::onRemuxFinished()
-{
-    // Both tracks fully written to the local output file. Playback is
-    // already underway (kicked off from onRemuxHeadReady()) -- this is
-    // just a diagnostic hook / place to hang future cache-management logic.
-#ifdef QT_DEBUG
-    if (remuxSession) {
-        qDebug() << "[bbtube][remux] finished writing" << remuxSession->outputPath();
-    }
-#endif
 }
 
 QString PlayerPage::remuxOutputPathFor(QString videoId, QString quality)

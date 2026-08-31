@@ -146,17 +146,29 @@ void GlobalPlayerContext::onMediaStateChanged(bb::multimedia::MediaState::Type s
     npc->setMediaState(state);
 
     if (state == bb::multimedia::MediaState::Stopped) {
-        if (updateViewedPercent) {
-            DbHelper::setViewedPercent(this->videoMetadata.video.videoId, 10000);
-            VideoViewedPercentProxy::getInstance()->setViewedPercent(
-                    this->videoMetadata.video.videoId, 10000);
-        }
-        updateViewedPercent = true;
+        // "Stopped" is reported both when playback truly reaches the end
+        // of the file and when it stops for any other reason (user
+        // pause, a transient error, etc). Only mark the video as fully
+        // watched / apply repeat-track behavior when we actually reached
+        // the end, otherwise a mid-video pause or hiccup gets recorded as
+        // "100% watched" and can trigger an unwanted repeat.
+        unsigned int position = mediaPlayer->position();
+        unsigned int duration = mediaPlayer->duration();
+        bool reachedEnd = duration > 0 && position >= duration - 1500;
 
-        if (repeatMode == bb::multimedia::RepeatMode::Track) {
-            mediaPlayer->play();
+        if (reachedEnd) {
+            if (updateViewedPercent) {
+                DbHelper::setViewedPercent(this->videoMetadata.video.videoId, 10000);
+                VideoViewedPercentProxy::getInstance()->setViewedPercent(
+                        this->videoMetadata.video.videoId, 10000);
+            }
+            updateViewedPercent = true;
 
-            return;
+            if (repeatMode == bb::multimedia::RepeatMode::Track) {
+                mediaPlayer->play();
+
+                return;
+            }
         }
     }
 

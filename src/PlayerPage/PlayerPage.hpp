@@ -89,7 +89,6 @@ private slots:
     void onPlaylistVideoDeleted(QString videoId, PlaylistListItemModel::Type playlistType);
     void onPlaylistVideoDeletedAll(PlaylistListItemModel::Type playlistType);
     void onRemuxHeadReady();
-    void onRemuxAudioComplete();
     void onRemuxFailed(QString errorMessage);
     void onRemuxFinished();
 private:

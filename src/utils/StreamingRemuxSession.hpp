@@ -131,6 +131,7 @@ private:
     void requestNextFragBody(bool isVideoTrack); // audio only now -- see class-level comment above onVideoBodyBatchFinished()
     void buildVideoBodyBatches(); // computes m_videoBodyBatches once, up front
     void dispatchVideoBodyBatches(); // fills the FRAG_BODY_CONCURRENCY window
+    void retryVideoBodyBatch(size_t batchIndex); // re-issues a single batch after a transient failure
 
     QNetworkAccessManager *m_networkManager;
     QString m_videoUrl;
@@ -139,6 +140,15 @@ private:
 
     int m_videoHeadFetchSize;
     int m_audioHeadFetchSize;
+    // Retry counters for a transient network error (timeout, dropped
+    // connection) on the initial head fetch itself -- distinct from
+    // m_video/audioHeadFetchSize's "double and retry" loop above, which
+    // only handles a head that came back OK but too small to contain a
+    // full moov/sidx. A network error has nothing to do with fetch size,
+    // so it's retried at the SAME size up to BODY_MAX_RETRIES times
+    // before giving up.
+    int m_videoHeadRetryCount;
+    int m_audioHeadRetryCount;
     bool m_videoHeadParsed;
     bool m_audioHeadParsed;
     bool m_planStarted;
@@ -220,6 +230,16 @@ private:
     size_t m_videoBodyDispatchIndex; // next batch index still needing a request DISPATCHED
     size_t m_videoBodyCompletedCount; // how many batches have finished (any order)
     QList<QNetworkReply *> m_videoBodyReplies; // in-flight, order not significant
+    // Per-batch retry counters for transient body-fetch failures (network
+    // error, or a Range request the relay answered with the wrong byte
+    // count -- e.g. HTTP 200 with an empty body instead of 206 with the
+    // requested range, seen in the field on a slow/flaky relay). Sized
+    // alongside m_videoBodyBatches in buildVideoBodyBatches(); a batch
+    // that exhausts BODY_MAX_RETRIES still fails the session via
+    // failWith() as before. Unlike the moof-discovery retry counters
+    // above, these are NOT shared with them -- a body batch and a moof
+    // fragment are different requests against different byte ranges.
+    std::vector<int> m_videoBodyRetries;
 
     // Audio: still single-request-at-a-time -- small enough that the
     // extra plumbing for concurrency isn't worth it.
@@ -227,6 +247,12 @@ private:
     size_t m_audioFragBodyBatchCount;
     qint64 m_audioFragBodyOffsetSoFar;
     QNetworkReply *m_audioFragBodyReply;
+    // Retry counter for the audio body batch currently in flight -- reset
+    // to 0 each time m_audioFragBodyIndex advances to a new batch start,
+    // since retries re-request the SAME batch (same fragIndex/batchCount)
+    // rather than moving the cursor forward. See m_videoBodyRetries above
+    // for why this exists.
+    int m_audioFragBodyRetryCount;
 };
 
 #endif /* STREAMINGREMUXSESSION_HPP_ */
